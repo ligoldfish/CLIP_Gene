@@ -11,3 +11,15 @@ from .retrieval import (
     encode_all_texts,
     compute_retrieval_metrics,
 )
+from .dataset_registry import (
+    CIFAR100DatasetPaths,
+    FindGeneDatasetPaths,
+    ITMDatasetPaths,
+    ImageNetDatasetPaths,
+    MultiLabelDatasetPaths,
+    PretrainDatasetPaths,
+    RetrievalDatasetPaths,
+    get_data_root,
+    get_task_dataset_placeholders,
+    is_placeholder_path,
+)

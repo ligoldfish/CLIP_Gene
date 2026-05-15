@@ -7,6 +7,7 @@ import torch
 import torch.nn.functional as F
 
 from .common import l2_normalize, default_clip_image_transform
+from scripts.utils.device import resolve_device
 
 
 class ModelAdapter(Protocol):
@@ -37,8 +38,7 @@ class OpenAIClipAdapter:
 
     def __post_init__(self):
         import clip  # openai clip
-        dev = self.device_str if torch.cuda.is_available() and self.device_str.startswith("cuda") else "cpu"
-        self._device = torch.device(dev)
+        self._device = resolve_device(self.device_str, allow_cpu_fallback=True)
 
         model, preprocess = clip.load(self.clip_model_name, device=self._device, jit=False)
         self.model = model.eval()
@@ -85,8 +85,7 @@ class StudentCLIPAdapter:
     image_size: int = 224
 
     def __post_init__(self):
-        dev = self.device_str if torch.cuda.is_available() and self.device_str.startswith("cuda") else "cpu"
-        self._device = torch.device(dev)
+        self._device = resolve_device(self.device_str, allow_cpu_fallback=True)
         self.model = self.student_model.to(self._device).eval()
         # Use CLIP-like transform by default
         self._preprocess = default_clip_image_transform(self.image_size)
@@ -144,8 +143,7 @@ class OpenCLIPAdapter:
                 "open_clip_torch is not installed. Install: pip install open_clip_torch"
             ) from e
 
-        dev = self.device_str if torch.cuda.is_available() and self.device_str.startswith("cuda") else "cpu"
-        self._device = torch.device(dev)
+        self._device = resolve_device(self.device_str, allow_cpu_fallback=True)
 
         model, _, preprocess = open_clip.create_model_and_transforms(
             self.model_name, pretrained=self.pretrained, device=self._device

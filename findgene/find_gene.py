@@ -20,6 +20,11 @@ Outputs in out_dir:
 - rho_heatmap_text.png
 - rho_trends_visual.png       (topk + refs)
 - rho_trends_text.png
+- score_curve_visual.png      (all visual layers' rise-then-fall scores)
+- score_curve_text.png        (all text layers' rise-then-fall scores)
+- clip_layer_ablation.json    (baseline + per-layer drop-one ablations)
+- clip_layer_ablation_visual.png
+- clip_layer_ablation_text.png
 - selected_layers.json
 - learngene_visual.pt         (original CLIP resblock weights for selected indices)
 - learngene_text.pt
@@ -56,6 +61,14 @@ import matplotlib.pyplot as plt
 import clip
 from PIL import Image
 import types
+
+from scripts.align.teacher_taps import (
+    compute_remaining_layer_ids,
+    compute_remaining_tap_layers,
+    infer_last_gene_layers,
+)
+from scripts.utils.device import get_default_device, resolve_device, seed_accelerators
+from tasks.dataset_registry import FindGeneDatasetPaths
 
 try:
     import torchvision.transforms as T
@@ -367,7 +380,7 @@ def seed_everything(seed: int):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    seed_accelerators(seed)
 
 @torch.no_grad()
 def sample_abs_grads_from_paramlists(paramlists: List[List[torch.nn.Parameter]], sample_size: int) -> torch.Tensor:
@@ -513,6 +526,185 @@ def plot_trends(R: np.ndarray, layers: List[int], title: str, out_path: str):
     plt.close()
 
 
+def plot_score_curve(stats: List[Dict[str, float]], title: str, out_path: str):
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    xs = np.arange(len(stats), dtype=np.int64)
+    scores = np.array([float(s["score"]) for s in stats], dtype=np.float32)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(xs, scores, marker="o", linewidth=1.6)
+    plt.title(title)
+    plt.xlabel("Block index")
+    plt.ylabel("rise-then-fall score")
+    plt.grid(alpha=0.25, linestyle="--")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=220)
+    plt.close()
+
+
+def build_eval_loader(
+    ds: COCOCaptionDataset,
+    preprocess,
+    batch_size: int,
+    num_workers: int,
+    max_samples: int,
+    seed: int,
+):
+    indices = list(range(len(ds)))
+    rng = random.Random(seed)
+    rng.shuffle(indices)
+    if max_samples > 0:
+        indices = indices[: min(len(indices), max_samples)]
+    subset = Subset(ds, indices)
+    return DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=make_collate_fn(preprocess, prompt_mode=0, aug_mode="none", drop_p=0.0),
+    )
+
+
+@torch.no_grad()
+def evaluate_clip_dataset_metrics(model, loader, device, max_batches: int) -> Dict[str, float]:
+    model.eval()
+    total_loss = 0.0
+    total_i_acc = 0.0
+    total_t_acc = 0.0
+    total_samples = 0
+
+    for batch_idx, (images, texts) in enumerate(loader):
+        if max_batches > 0 and batch_idx >= max_batches:
+            break
+
+        images = images.to(device, non_blocking=True)
+        texts = texts.to(device, non_blocking=True)
+
+        logits_per_image, logits_per_text = model(images, texts)
+        labels = torch.arange(images.size(0), device=device)
+
+        loss = 0.5 * (
+            F.cross_entropy(logits_per_image, labels) +
+            F.cross_entropy(logits_per_text, labels)
+        )
+        i_acc = (logits_per_image.argmax(dim=-1) == labels).float().mean()
+        t_acc = (logits_per_text.argmax(dim=-1) == labels).float().mean()
+
+        bs = int(images.size(0))
+        total_loss += float(loss.item()) * bs
+        total_i_acc += float(i_acc.item()) * bs
+        total_t_acc += float(t_acc.item()) * bs
+        total_samples += bs
+
+    model.train()
+    denom = max(1, total_samples)
+    return {
+        "loss": total_loss / denom,
+        "image_acc": total_i_acc / denom,
+        "text_acc": total_t_acc / denom,
+        "num_samples": float(total_samples),
+    }
+
+
+class _ClipLayerDropper:
+    def __init__(self, model: nn.Module, tower: str, layer_idx: int):
+        self.model = model
+        self.tower = tower
+        self.layer_idx = int(layer_idx)
+        if tower == "visual":
+            self.parent = model.visual.transformer
+        elif tower == "text":
+            self.parent = model.transformer
+        else:
+            raise ValueError(f"Unknown tower={tower!r}")
+        self.original = None
+
+    def __enter__(self):
+        self.original = self.parent.resblocks
+        blocks = list(self.original)
+        if self.layer_idx < 0 or self.layer_idx >= len(blocks):
+            raise IndexError(f"layer_idx={self.layer_idx} out of range for tower={self.tower}")
+        kept = [blk for i, blk in enumerate(blocks) if i != self.layer_idx]
+        self.parent.resblocks = nn.Sequential(*kept)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.parent.resblocks = self.original
+        return False
+
+
+def plot_ablation_metrics(
+    records: List[Dict[str, float]],
+    tower_name: str,
+    out_path: str,
+):
+    if len(records) == 0:
+        return
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    xs = np.array([int(r["layer"]) for r in records], dtype=np.int64)
+    losses = np.array([float(r["loss"]) for r in records], dtype=np.float32)
+    i_acc = np.array([float(r["image_acc"]) for r in records], dtype=np.float32)
+    t_acc = np.array([float(r["text_acc"]) for r in records], dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    axes[0].plot(xs, losses, marker="o", linewidth=1.6, color="#c53b2f")
+    axes[0].set_ylabel("loss")
+    axes[0].set_title(f"{tower_name} layer drop-one ablation")
+    axes[0].grid(alpha=0.25, linestyle="--")
+
+    axes[1].plot(xs, i_acc, marker="o", linewidth=1.4, label="image_acc")
+    axes[1].plot(xs, t_acc, marker="s", linewidth=1.4, label="text_acc")
+    axes[1].set_xlabel("Dropped block index")
+    axes[1].set_ylabel("accuracy")
+    axes[1].grid(alpha=0.25, linestyle="--")
+    axes[1].legend()
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=220)
+    plt.close()
+
+
+def run_clip_layer_ablation(
+    model: nn.Module,
+    loader,
+    device,
+    max_batches: int,
+) -> Dict[str, object]:
+    baseline = evaluate_clip_dataset_metrics(model, loader, device=device, max_batches=max_batches)
+    n_visual = len(model.visual.transformer.resblocks)
+    n_text = len(model.transformer.resblocks)
+
+    visual_records = []
+    for li in range(n_visual):
+        with _ClipLayerDropper(model, "visual", li):
+            metrics = evaluate_clip_dataset_metrics(model, loader, device=device, max_batches=max_batches)
+        metrics["layer"] = li
+        metrics["tower"] = "visual"
+        metrics["delta_loss"] = float(metrics["loss"] - baseline["loss"])
+        metrics["delta_image_acc"] = float(metrics["image_acc"] - baseline["image_acc"])
+        metrics["delta_text_acc"] = float(metrics["text_acc"] - baseline["text_acc"])
+        visual_records.append(metrics)
+
+    text_records = []
+    for li in range(n_text):
+        with _ClipLayerDropper(model, "text", li):
+            metrics = evaluate_clip_dataset_metrics(model, loader, device=device, max_batches=max_batches)
+        metrics["layer"] = li
+        metrics["tower"] = "text"
+        metrics["delta_loss"] = float(metrics["loss"] - baseline["loss"])
+        metrics["delta_image_acc"] = float(metrics["image_acc"] - baseline["image_acc"])
+        metrics["delta_text_acc"] = float(metrics["text_acc"] - baseline["text_acc"])
+        text_records.append(metrics)
+
+    return {
+        "baseline": baseline,
+        "visual": visual_records,
+        "text": text_records,
+    }
+
+
 # -------------------------
 # Save learngene weights (original CLIP blocks)
 # -------------------------
@@ -553,18 +745,91 @@ def save_all_adapters_state(model, out_dir: str):
     torch.save(adapters, os.path.join(out_dir, "adapters_state.pt"))
 
 
+def _preset_mixed_layers(total_layers: int) -> List[int]:
+    """Legacy mixed preset: one middle layer plus the last two layers, returned 0-indexed."""
+
+    if total_layers <= 0:
+        return []
+    if total_layers <= 3:
+        return list(range(total_layers))
+    middle = max(0, total_layers // 2 - 1)
+    last_two = list(range(total_layers - 2, total_layers))
+    return sorted(set([middle] + last_two))
+
+
+def _lastn_zero_indexed(total_layers: int, gene_layers: int) -> List[int]:
+    return [idx - 1 for idx in infer_last_gene_layers(total_layers, gene_layers)]
+
+
+def _resolve_gene_selection(
+    args,
+    n_visual: int,
+    n_text: int,
+    v_ranked: List[int],
+    t_ranked: List[int],
+) -> Tuple[List[int], List[int], Dict[str, object]]:
+    variant = (getattr(args, "variant", "") or "").lower()
+    strategy = getattr(args, "selection_strategy", "lastn")
+    gene_layers = int(getattr(args, "gene_layers", 3))
+
+    if variant in ("ours2", "ours-2"):
+        strategy = "lastn"
+        gene_layers = 2
+    elif variant in ("ours3", "ours-3"):
+        strategy = "lastn"
+        gene_layers = 3
+    elif variant in ("ours26", "ours-26", "last2_plus6"):
+        strategy = "preset"
+        gene_layers = 3
+
+    if strategy == "lastn":
+        top_v = _lastn_zero_indexed(n_visual, gene_layers)
+        top_t = _lastn_zero_indexed(n_text, gene_layers)
+        note = f"stable last-{gene_layers}; gradient ranking is diagnostic only"
+    elif strategy == "gradient":
+        count = max(1, min(gene_layers, n_visual, n_text))
+        top_v = sorted(int(x) for x in v_ranked[:count])
+        top_t = sorted(int(x) for x in t_ranked[:count])
+        note = "gradient top-k diagnostic/legacy selection"
+    elif strategy == "preset":
+        top_v = _preset_mixed_layers(n_visual)
+        top_t = _preset_mixed_layers(n_text)
+        note = "legacy mixed preset: one middle layer plus last two; not used as gradient top-k evidence"
+    else:
+        raise ValueError(f"Unknown selection_strategy: {strategy}")
+
+    metadata = {
+        "selection_strategy": strategy,
+        "variant": variant or None,
+        "gene_layers": gene_layers,
+        "selection_note": note,
+    }
+    return top_v, top_t, metadata
+
+
+def _tower_metadata(total_layers: int, selected_zero_indexed: List[int]) -> Dict[str, object]:
+    gene_layer_ids = [int(x) + 1 for x in selected_zero_indexed]
+    return {
+        "teacher_total_layers": int(total_layers),
+        "gene_layer_ids": gene_layer_ids,
+        "remaining_layer_ids": compute_remaining_layer_ids(total_layers, gene_layer_ids),
+        "distill_tap_layers": compute_remaining_tap_layers(total_layers, gene_layer_ids, num_taps=3),
+    }
+
+
 # -------------------------
 # Main
 # -------------------------
 def main():
     parser = argparse.ArgumentParser()
+    data_defaults = FindGeneDatasetPaths()
 
-    parser.add_argument("--coco_img_dir", type=str, required=True)
-    parser.add_argument("--coco_ann_file", type=str, required=True)
+    parser.add_argument("--coco_img_dir", type=str, default=data_defaults.coco_images)
+    parser.add_argument("--coco_ann_file", type=str, default=data_defaults.coco_captions_json)
     parser.add_argument("--out_dir", type=str, required=True)
 
     parser.add_argument("--clip_model", type=str, default="ViT-B/32")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="cpu/cuda/npu/auto")
 
     parser.add_argument("--num_tasks", type=int, default=40)
     parser.add_argument("--steps_per_task", type=int, default=150)
@@ -588,7 +853,14 @@ def main():
 
     parser.add_argument("--record_every", type=int, default=1)
     parser.add_argument("--topk", type=int, default=3)
+    parser.add_argument("--selection_strategy", type=str, default="lastn", choices=["lastn", "gradient", "preset"])
+    parser.add_argument("--gene_layers", type=int, default=3, choices=[2, 3])
+    parser.add_argument("--variant", type=str, default="", choices=["", "ours2", "ours3", "ours26", "ours-2", "ours-3", "ours-26", "last2_plus6"])
     parser.add_argument("--prefer_last_ratio", type=float, default=0.5)
+    parser.add_argument("--ablation_eval_samples", type=int, default=2048,
+                        help="number of dataset samples used for post-hoc CLIP layer ablation evaluation")
+    parser.add_argument("--ablation_eval_batches", type=int, default=8,
+                        help="number of eval batches used for post-hoc CLIP layer ablation evaluation")
 
     parser.add_argument("--seed", type=int, default=42)
 
@@ -596,7 +868,8 @@ def main():
     seed_everything(args.seed)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    device = resolve_device(args.device, allow_cpu_fallback=False)
+    args.device = str(device)
 
     # Load CLIP
     model, preprocess = clip.load(args.clip_model, device=device, jit=False)
@@ -749,16 +1022,31 @@ def main():
     v_stats, v_ranked = score_rise_then_fall_rho(Rv, prefer_last_ratio=args.prefer_last_ratio)
     t_stats, t_ranked = score_rise_then_fall_rho(Rt, prefer_last_ratio=args.prefer_last_ratio)
 
-    top_v = v_ranked[:args.topk]
-    top_t = t_ranked[:args.topk]
+    gradient_top_v = [int(x) for x in v_ranked[:args.topk]]
+    gradient_top_t = [int(x) for x in t_ranked[:args.topk]]
+    lastn_baseline_v = _lastn_zero_indexed(n_visual, int(args.gene_layers))
+    lastn_baseline_t = _lastn_zero_indexed(n_text, int(args.gene_layers))
+    top_v, top_t, selection_meta = _resolve_gene_selection(args, n_visual, n_text, v_ranked, t_ranked)
+    visual_tower_meta = _tower_metadata(n_visual, top_v)
+    text_tower_meta = _tower_metadata(n_text, top_t)
+    visual_scores = [float(s["score"]) for s in v_stats]
+    text_scores = [float(s["score"]) for s in t_stats]
+
+    print("\n[DIAGNOSTIC] Gradient top-k blocks (VISUAL):", gradient_top_v)
+    print("[DIAGNOSTIC] Gradient top-k blocks (TEXT):", gradient_top_t)
+    print("[DIAGNOSTIC] Last-N baseline blocks (VISUAL):", lastn_baseline_v)
+    print("[DIAGNOSTIC] Last-N baseline blocks (TEXT):", lastn_baseline_t)
+    print(f"[RESULT] selection_strategy={selection_meta['selection_strategy']} note={selection_meta['selection_note']}")
 
     print("\n[RESULT] Selected learngene blocks (VISUAL):", top_v)
+    print("[RESULT] VISUAL metadata:", visual_tower_meta)
     for i in top_v:
         s = v_stats[i]
         print(f"  - B{i}: early={s['early_mean']:.4f} late={s['late_mean']:.4f} peak={s['peak']:.4f} "
               f"peak_step={s['peak_step']} score={s['score']:.6f}")
 
     print("\n[RESULT] Selected learngene blocks (TEXT):", top_t)
+    print("[RESULT] TEXT metadata:", text_tower_meta)
     for i in top_t:
         s = t_stats[i]
         print(f"  - B{i}: early={s['early_mean']:.4f} late={s['late_mean']:.4f} peak={s['peak']:.4f} "
@@ -771,8 +1059,18 @@ def main():
         meta=meta_np,
         sigma_v=np.array([0.0 if sigma_v is None else sigma_v], dtype=np.float32),
         sigma_t=np.array([0.0 if sigma_t is None else sigma_t], dtype=np.float32),
+        visual_scores=np.array(visual_scores, dtype=np.float32),
+        text_scores=np.array(text_scores, dtype=np.float32),
         topk_visual=np.array(top_v, dtype=np.int64),
         topk_text=np.array(top_t, dtype=np.int64),
+        gradient_top_visual=np.array(gradient_top_v, dtype=np.int64),
+        gradient_top_text=np.array(gradient_top_t, dtype=np.int64),
+        lastn_visual=np.array(lastn_baseline_v, dtype=np.int64),
+        lastn_text=np.array(lastn_baseline_t, dtype=np.int64),
+        selected_visual=np.array(top_v, dtype=np.int64),
+        selected_text=np.array(top_t, dtype=np.int64),
+        distill_tap_visual=np.array(visual_tower_meta["distill_tap_layers"], dtype=np.int64),
+        distill_tap_text=np.array(text_tower_meta["distill_tap_layers"], dtype=np.int64),
     )
 
     # Plots
@@ -784,6 +1082,35 @@ def main():
     ref_t = sorted(set(top_t + [max(0, n_text//4), max(0, n_text//2), max(0, n_text-1)]))
     plot_trends(Rv, ref_v, "VISUAL Adapter ρ(t) trends (topk + refs)", os.path.join(args.out_dir, "rho_trends_visual.png"))
     plot_trends(Rt, ref_t, "TEXT Adapter ρ(t) trends (topk + refs)", os.path.join(args.out_dir, "rho_trends_text.png"))
+    plot_score_curve(v_stats, "VISUAL tower all-layer scores", os.path.join(args.out_dir, "score_curve_visual.png"))
+    plot_score_curve(t_stats, "TEXT tower all-layer scores", os.path.join(args.out_dir, "score_curve_text.png"))
+
+    eval_loader = build_eval_loader(
+        ds=ds,
+        preprocess=preprocess,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        max_samples=args.ablation_eval_samples,
+        seed=args.seed,
+    )
+    ablation_results = run_clip_layer_ablation(
+        model=model,
+        loader=eval_loader,
+        device=device,
+        max_batches=args.ablation_eval_batches,
+    )
+    with open(os.path.join(args.out_dir, "clip_layer_ablation.json"), "w", encoding="utf-8") as f:
+        json.dump(ablation_results, f, ensure_ascii=False, indent=2)
+    plot_ablation_metrics(
+        ablation_results["visual"],
+        tower_name="VISUAL",
+        out_path=os.path.join(args.out_dir, "clip_layer_ablation_visual.png"),
+    )
+    plot_ablation_metrics(
+        ablation_results["text"],
+        tower_name="TEXT",
+        out_path=os.path.join(args.out_dir, "clip_layer_ablation_text.png"),
+    )
 
     # Save selected info
     with open(os.path.join(args.out_dir, "selected_layers.json"), "w", encoding="utf-8") as f:
@@ -802,12 +1129,39 @@ def main():
                 "sigma_sample": args.sigma_sample,
                 "sigma_v": None if sigma_v is None else float(sigma_v),
                 "sigma_t": None if sigma_t is None else float(sigma_t),
+                "visual_scores": visual_scores,
+                "text_scores": text_scores,
                 "prefer_last_ratio": args.prefer_last_ratio,
                 "topk": args.topk,
+                "selection_strategy": selection_meta["selection_strategy"],
+                "variant": selection_meta["variant"],
+                "gene_layers": selection_meta["gene_layers"],
+                "selection_note": selection_meta["selection_note"],
+                "gradient_topk": {
+                    "visual": gradient_top_v,
+                    "text": gradient_top_t,
+                },
+                "lastn_baseline": {
+                    "visual": lastn_baseline_v,
+                    "text": lastn_baseline_t,
+                },
+                "clip_layer_ablation": {
+                    "eval_samples": args.ablation_eval_samples,
+                    "eval_batches": args.ablation_eval_batches,
+                    "baseline": ablation_results["baseline"],
+                },
                 "task_split": "topic+length buckets",
                 "task_shift": "per-task prompt template + augmentation mode + word dropout",
-                "visual": {"selected": top_v, "stats": {str(i): v_stats[i] for i in top_v}},
-                "text": {"selected": top_t, "stats": {str(i): t_stats[i] for i in top_t}},
+                "visual": {
+                    "selected": top_v,
+                    **visual_tower_meta,
+                    "stats": {str(i): v_stats[i] for i in top_v},
+                },
+                "text": {
+                    "selected": top_t,
+                    **text_tower_meta,
+                    "stats": {str(i): t_stats[i] for i in top_t},
+                },
             },
             f,
             ensure_ascii=False,
@@ -824,6 +1178,9 @@ def main():
     print("  - rho_logs.npz")
     print("  - rho_heatmap_visual.png / rho_heatmap_text.png")
     print("  - rho_trends_visual.png / rho_trends_text.png")
+    print("  - score_curve_visual.png / score_curve_text.png")
+    print("  - clip_layer_ablation.json")
+    print("  - clip_layer_ablation_visual.png / clip_layer_ablation_text.png")
     print("  - selected_layers.json")
     print("  - learngene_visual.pt / learngene_text.pt / learngene_multimodal.pt")
     print("  - adapters_state.pt")

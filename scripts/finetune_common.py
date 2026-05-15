@@ -11,13 +11,12 @@ import torch.nn.functional as F
 
 from scripts.utils.misc import unwrap_model, is_main_process
 from scripts.data.transforms import build_clip_image_transform
+from scripts.utils.device import autocast_context, enable_tf32 as _enable_tf32, resolve_device
 
 
 def enable_tf32(enable: bool = True):
     """Enable TF32 on supported NVIDIA GPUs (Ampere+)."""
-    if torch.cuda.is_available():
-        torch.backends.cuda.matmul.allow_tf32 = enable
-        torch.backends.cudnn.allow_tf32 = enable
+    _enable_tf32(enable)
 
 
 def get_model_image_dtype(model: nn.Module) -> torch.dtype:
@@ -180,7 +179,7 @@ class FinetunedModelAdapter:
                  amp=False, amp_dtype="bf16"):
         self.model = model
         self._tokenize = tokenize
-        self.device = torch.device(device)
+        self.device = resolve_device(device, allow_cpu_fallback=True)
         self._preprocess = build_clip_image_transform(image_size, is_train=False)
         self.amp = bool(amp)
         # accept both string ("bf16"/"fp16") and torch.dtype
@@ -199,7 +198,7 @@ class FinetunedModelAdapter:
     def encode_image(self, images):
         self.model.eval()
         images = images.to(self.device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=self.amp, dtype=self.amp_dtype):
+        with autocast_context(self.device, enabled=self.amp, dtype=self.amp_dtype):
             # StudentCLIP/ours has forward(image, text) and may not implement .encode_image();
             # use helper encode_image(model, images) defined in this file.
             z = encode_image(self.model, images)
@@ -210,7 +209,7 @@ class FinetunedModelAdapter:
     def encode_text(self, tokens):
         self.model.eval()
         tokens = tokens.to(self.device, non_blocking=True)
-        with torch.cuda.amp.autocast(enabled=self.amp, dtype=self.amp_dtype):
+        with autocast_context(self.device, enabled=self.amp, dtype=self.amp_dtype):
             # StudentCLIP/ours may not implement .encode_text();
             # use helper encode_text(model, tokens) defined in this file.
             z = encode_text(self.model, tokens)

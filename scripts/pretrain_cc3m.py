@@ -104,6 +104,7 @@ import math
 import os
 from dataclasses import asdict
 from typing import Iterable, List, Tuple
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -122,13 +123,35 @@ from scripts.data.webdataset_pairs import WdsPairConfig, build_wds_pairs, defaul
 from scripts.model_factory import create_model_bundle, split_param_groups, set_requires_grad
 from scripts.losses import clip_contrastive_loss
 from scripts.optim import set_optimizer_lrs
+from scripts.align.teacher_taps import (
+    CLIPTeacherDistiller,
+    TapConfig,
+    compute_remaining_tap_layers,
+    infer_last_gene_layers,
+)
+from scripts.align.soft_align import (
+    SoftAlignWeights,
+    embedding_distillation_loss,
+    similarity_distillation_loss,
+    soft_align_layers,
+)
 from scripts.utils.distributed import setup_distributed, get_rank, get_world_size
 from scripts.utils.misc import seed_everything, mkdir, is_main_process, unwrap_model
 from scripts.utils.checkpoint import save_checkpoint
+from scripts.utils.device import (
+    autocast_context,
+    enable_tf32,
+    get_default_device,
+    is_accelerator_device,
+    make_grad_scaler,
+    normalize_backend,
+    resolve_amp_dtype,
+    resolve_device,
+    scaler_is_enabled,
+)
+from tasks.dataset_registry import PretrainDatasetPaths
 # --- TF32 (Ampere/Ada/Hopper GPUs) ---
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
+enable_tf32(True)
 
 try:
     torch.set_float32_matmul_precision("high")
@@ -306,6 +329,124 @@ def forward_features(model: nn.Module, images: torch.Tensor, tokens: torch.Tenso
     raise RuntimeError("Model does not support encode_image/encode_text and has no known StudentCLIP stems/towers")
 
 
+def forward_features_with_aux(
+    model: nn.Module,
+    images: torch.Tensor,
+    tokens: torch.Tensor,
+):
+    if hasattr(model, "encode_image_with_aux") and hasattr(model, "encode_text_with_aux"):
+        z_img, v_aux = model.encode_image_with_aux(images)
+        z_txt, t_aux = model.encode_text_with_aux(tokens)
+        return z_img, z_txt, v_aux, t_aux
+
+    z_img, z_txt = forward_features(model, images, tokens)
+    return z_img, z_txt, None, None
+
+
+def _parse_tap_layers(spec: str, total_layers: int, target_count: int) -> List[int]:
+    if spec:
+        vals = []
+        for chunk in str(spec).replace(";", ",").split(","):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            vals.append(int(chunk))
+        vals = sorted({min(total_layers, max(1, v)) for v in vals})
+        if len(vals) == 0:
+            raise ValueError(f"Invalid tap layer spec: {spec!r}")
+        return vals
+
+    count = max(1, min(int(target_count), int(total_layers)))
+    if count == 1:
+        return [int(total_layers)]
+    pos = np.linspace(1, total_layers, num=count)
+    return sorted({int(round(x)) for x in pos})
+
+
+def build_teacher_distiller_module(args) -> Optional[CLIPTeacherDistiller]:
+    if getattr(args, "distill_mode", "none") == "none" or args.model != "ours":
+        args.teacher_total_visual_layers = 0
+        args.teacher_total_text_layers = 0
+        args.gene_visual_layers = []
+        args.gene_text_layers = []
+        args.distill_vision_layers = []
+        args.distill_text_layers = []
+        return None
+
+    try:
+        import clip
+    except Exception as e:
+        raise RuntimeError("distillation requires OpenAI CLIP (`pip install git+https://github.com/openai/CLIP.git`)") from e
+
+    teacher_name = (
+        getattr(args, "distill_clip_name", "")
+        or getattr(args, "teacher_tap_clip_name", "")
+        or getattr(args, "clip_name", "ViT-B/32")
+    )
+    teacher, _ = clip.load(teacher_name, device="cpu", jit=False)
+    teacher.eval()
+
+    n_visual = len(teacher.visual.transformer.resblocks)
+    n_text = len(teacher.transformer.resblocks)
+    gene_layers = int(getattr(args, "gene_layers", 3))
+    gene_visual_layers = infer_last_gene_layers(n_visual, gene_layers)
+    gene_text_layers = infer_last_gene_layers(n_text, gene_layers)
+
+    vision_spec = getattr(args, "teacher_tap_vision_layers", "")
+    text_spec = getattr(args, "teacher_tap_text_layers", "")
+    vision_taps = (
+        _parse_tap_layers(vision_spec, n_visual, 3)
+        if vision_spec
+        else compute_remaining_tap_layers(n_visual, gene_visual_layers, num_taps=3)
+    )
+    text_taps = (
+        _parse_tap_layers(text_spec, n_text, 3)
+        if text_spec
+        else compute_remaining_tap_layers(n_text, gene_text_layers, num_taps=3)
+    )
+
+    args.teacher_total_visual_layers = n_visual
+    args.teacher_total_text_layers = n_text
+    args.gene_visual_layers = gene_visual_layers
+    args.gene_text_layers = gene_text_layers
+    args.distill_vision_layers = vision_taps
+    args.distill_text_layers = text_taps
+
+    tap_cfg = TapConfig(
+        vision_layers=vision_taps,
+        text_layers=text_taps,
+    )
+
+    if is_main_process():
+        print(
+            f"[Distill] mode={getattr(args, 'distill_mode', 'none')} teacher={teacher_name} "
+            f"gene_layers={gene_layers} gene_visual={gene_visual_layers} gene_text={gene_text_layers} "
+            f"vision_taps={tap_cfg.vision_layers} text_taps={tap_cfg.text_layers} "
+            f"weights(feature={getattr(args, 'distill_feature_weight', 0.0):.4f}, "
+            f"logit={getattr(args, 'distill_logit_weight', 0.0):.4f}, "
+            f"embed={getattr(args, 'distill_embed_weight', 0.0):.4f})"
+        )
+
+    return CLIPTeacherDistiller(
+        clip_model=teacher,
+        tap_cfg=tap_cfg,
+        device=torch.device(args.device),
+        teacher_fp16=bool(getattr(args, "teacher_tap_fp16", True)),
+    )
+
+
+def _select_student_layers_for_distill(layers: List[torch.Tensor], target_count: int) -> List[torch.Tensor]:
+    """Map arbitrary shallow depth to the three teacher taps without changing model depth."""
+
+    if len(layers) <= target_count:
+        return layers
+    if target_count <= 1:
+        return [layers[-1]]
+    positions = np.linspace(0, len(layers) - 1, num=target_count)
+    idxs = sorted({int(round(x)) for x in positions})
+    return [layers[i] for i in idxs]
+
+
 def get_logit_scale(model: nn.Module, max_scale: float = 100.0) -> torch.Tensor:
     if hasattr(model, "logit_scale"):
         ls = model.logit_scale
@@ -455,7 +596,7 @@ def evaluate(args, model, val_loader: Iterable, steps: int) -> float:
             images, tokens = batch
             images = images.to(device, non_blocking=True)
             tokens = tokens.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=args.amp, dtype=args._amp_autocast_dtype):
+            with autocast_context(device, enabled=args.amp, dtype=args._amp_autocast_dtype):
                 img_f, txt_f = forward_features(base_model, images, tokens)
                 loss = clip_contrastive_loss(img_f, txt_f, get_logit_scale(base_model, args.logit_scale_max))
 
@@ -509,7 +650,9 @@ def train_one_epoch(
 
     # staged freeze/unfreeze for ours
     if args.model == "ours":
-        if global_step < unfreeze_step:
+        if getattr(args, "frozen", False):
+            set_requires_grad(args._gene_params, False)
+        elif global_step < unfreeze_step:
             set_requires_grad(args._gene_params, False)
         else:
             set_requires_grad(args._gene_params, True)
@@ -543,14 +686,19 @@ def train_one_epoch(
 
         # If unfreeze happens mid-epoch (e.g., --unfreeze_steps), ensure gene params are toggled per step.
         if args.model == "ours" and getattr(args, "_has_gene_groups", False):
-            set_requires_grad(args._gene_params, global_step >= unfreeze_step)
+            if getattr(args, "frozen", False):
+                set_requires_grad(args._gene_params, False)
+            else:
+                set_requires_grad(args._gene_params, global_step >= unfreeze_step)
 
         # LR schedule (by optimizer step)
         lr_new = lr_warmup_cosine(global_step, total_steps, args.lr, args.min_lr, args.warmup_steps)
 
         if args._has_gene_groups:
             # gene lr: 0 before unfreeze, then warmup to lr_new/gene_lr_ratio
-            if global_step < unfreeze_step:
+            if getattr(args, "frozen", False):
+                gene_lr = 0.0
+            elif global_step < unfreeze_step:
                 gene_lr = 0.0
             else:
                 target = lr_new / args.gene_lr_ratio
@@ -566,9 +714,65 @@ def train_one_epoch(
             # groups: all(decay/no_decay)
             set_optimizer_lrs(optimizer, [lr_new, lr_new])
 
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=args._amp_autocast_dtype):
-            img_f, txt_f = forward_features(base_model, images, tokens)
-            loss = clip_contrastive_loss(img_f, txt_f, get_logit_scale(base_model, args.logit_scale_max))
+        contrastive_loss = None
+        tap_feature_loss = None
+        logit_distill_loss = None
+        embed_distill_loss = None
+        with autocast_context(device, enabled=args.amp, dtype=args._amp_autocast_dtype):
+            img_f, txt_f, v_aux, t_aux = forward_features_with_aux(base_model, images, tokens)
+            contrastive_loss = clip_contrastive_loss(img_f, txt_f, get_logit_scale(base_model, args.logit_scale_max))
+            loss = contrastive_loss
+            if (
+                loss is not None
+                and getattr(args, "_teacher_distiller", None) is not None
+                and v_aux is not None
+                and t_aux is not None
+            ):
+                teacher_out = args._teacher_distiller(images, tokens)
+                mode = getattr(args, "distill_mode", "none")
+                if (
+                    mode in ("tap", "tap_logit")
+                    and float(getattr(args, "distill_feature_weight", 0.0)) > 0
+                    and teacher_out.vision_layers
+                    and teacher_out.text_layers
+                ):
+                    student_v = _select_student_layers_for_distill(v_aux.get("shallow", []), len(teacher_out.vision_layers))
+                    student_t = _select_student_layers_for_distill(t_aux.get("shallow", []), len(teacher_out.text_layers))
+                    if len(student_v) == len(teacher_out.vision_layers) and len(student_t) == len(teacher_out.text_layers):
+                        tap_feature_loss = (
+                            soft_align_layers(
+                                student_v,
+                                teacher_out.vision_layers,
+                                weights=args._teacher_tap_weights,
+                                drop_cls=bool(getattr(args, "teacher_tap_drop_cls", True)),
+                            )
+                            + soft_align_layers(
+                                student_t,
+                                teacher_out.text_layers,
+                                weights=args._teacher_tap_weights,
+                                drop_cls=False,
+                            )
+                        )
+                        loss = loss + float(args.distill_feature_weight) * tap_feature_loss
+
+                if mode == "tap_logit":
+                    if float(getattr(args, "distill_logit_weight", 0.0)) > 0:
+                        logit_distill_loss = similarity_distillation_loss(
+                            img_f,
+                            txt_f,
+                            teacher_out.similarity_logits,
+                            student_logit_scale=get_logit_scale(base_model, args.logit_scale_max),
+                            temperature=float(getattr(args, "distill_temperature", 1.0)),
+                        )
+                        loss = loss + float(args.distill_logit_weight) * logit_distill_loss
+                    if float(getattr(args, "distill_embed_weight", 0.0)) > 0:
+                        embed_distill_loss = embedding_distillation_loss(
+                            img_f,
+                            txt_f,
+                            teacher_out.image_features,
+                            teacher_out.text_features,
+                        )
+                        loss = loss + float(args.distill_embed_weight) * embed_distill_loss
             if loss is not None:
                 loss = loss / float(accum)
 
@@ -669,7 +873,17 @@ def train_one_epoch(
                 lr_info = f"lr_new={optimizer.param_groups[0]['lr']:.2e} lr_gene={optimizer.param_groups[2]['lr']:.2e}"
             else:
                 lr_info = f"lr={optimizer.param_groups[0]['lr']:.2e}"
-            print(f"[E{epoch:03d}] step={global_step} loss={(loss.item()*accum):.4f} {lr_info}")
+            extra_parts = []
+            if contrastive_loss is not None:
+                extra_parts.append(f"contrastive={float(contrastive_loss.item()):.4f}")
+            if tap_feature_loss is not None:
+                extra_parts.append(f"tap_feature={float(tap_feature_loss.item()):.4f}")
+            if logit_distill_loss is not None:
+                extra_parts.append(f"logit_distill={float(logit_distill_loss.item()):.4f}")
+            if embed_distill_loss is not None:
+                extra_parts.append(f"embed_distill={float(embed_distill_loss.item()):.4f}")
+            extra = (" " + " ".join(extra_parts)) if extra_parts else ""
+            print(f"[E{epoch:03d}] step={global_step} loss={(loss.item()*accum):.4f}{extra} {lr_info}")
 
         global_step += 1
         opt_steps_done += 1
@@ -681,15 +895,19 @@ def train_one_epoch(
 
 def main():
     parser = argparse.ArgumentParser("Pretrain on CC3M (ours/clip/tinyclip) via WebDataset")
+    data_defaults = PretrainDatasetPaths()
 
     # model
     parser.add_argument("--model", type=str, default="ours", choices=["ours", "clip", "tinyclip"])
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="cpu/cuda/npu/auto")
     parser.add_argument("--image_size", type=int, default=224)
 
     # ours
     parser.add_argument("--gene_dir", type=str, default="", help="folder containing learngene_visual.pt / learngene_text.pt ...")
-    parser.add_argument("--shallow_layers", type=int, default=5)
+    parser.add_argument("--gene_layers", type=int, default=3, choices=[2, 3], help="Stable last-N gene depth inherited from CLIP.")
+    parser.add_argument("--shallow_layers", type=int, default=3)
+    parser.add_argument("--shallow_type", type=str, default="transformer", choices=["transformer", "cnn"])
+    parser.add_argument("--shallow_kernel_size", type=int, default=3)
     parser.add_argument("--bottleneck_dim", type=int, default=-1)
     parser.add_argument("--bottleneck_dropout", type=float, default=0.0)
     parser.add_argument("--proj_dim", type=int, default=512)
@@ -697,15 +915,20 @@ def main():
     parser.add_argument("--proj_hidden_dim", type=int, default=-1)
     parser.add_argument("--proj_dropout", type=float, default=0.0)
     parser.add_argument("--use_tleg", action="store_true")
+    parser.add_argument("--no_tleg", action="store_true", help="Disable TLEG even if the base config enables it.")
     parser.add_argument("--tleg_target_depth", type=int, default=4)
     parser.add_argument("--tleg_strict", action="store_true", help="paper-faithful strict TLEG (only 2 endpoints trainable)")
     parser.add_argument("--use_multimodal_init", action="store_true")
+    parser.add_argument("--frozen", action="store_true", help="Keep learngene frozen for the whole run.")
+    parser.add_argument("--no_frozen", action="store_true", help="Alias for enabling learngene unfreezing.")
 
-    # CLIP stem init (ours): default ON unless explicitly disabled
+    # CLIP stem init (ours): deprecated; main experiments keep it disabled.
+    parser.add_argument("--clip_init", action="store_true", help="[Deprecated] Ignored by the revised main experiments.")
+    parser.add_argument("--no_clip_init", action="store_true", help="[Deprecated] Kept for backward-compatible configs.")
     parser.add_argument(
         "--disable_stem_init_from_clip",
         action="store_true",
-        help="Disable copying CLIP vision/text stems (and ln_post) into the student at init.",
+        help="[Deprecated] CLIP stem initialization is disabled by default in the revised setup.",
     )
     parser.add_argument(
         "--stem_init_clip_name",
@@ -725,6 +948,23 @@ def main():
         default=5,
         help="enable TLEG only for last N epochs (default 1). set 0 to never enable.",
     )
+    parser.add_argument("--distill_mode", type=str, default="tap_logit", choices=["none", "tap", "tap_logit"])
+    parser.add_argument("--distill_clip_name", type=str, default="ViT-B/32", help="Teacher CLIP used only during training distillation.")
+    parser.add_argument("--distill_feature_weight", type=float, default=0.1)
+    parser.add_argument("--distill_logit_weight", type=float, default=0.5)
+    parser.add_argument("--distill_embed_weight", type=float, default=0.05)
+    parser.add_argument("--distill_temperature", type=float, default=1.0)
+    parser.add_argument("--teacher_tap", action="store_true", help="[Deprecated] Use --distill_mode tap_logit instead.")
+    parser.add_argument("--no_teacher_tap", action="store_true", help="[Deprecated] Alias for --distill_mode none.")
+    parser.add_argument("--teacher_tap_clip_name", type=str, default="", help="[Deprecated] Use --distill_clip_name.")
+    parser.add_argument("--teacher_tap_weight", type=float, default=0.0, help="[Deprecated] Use --distill_feature_weight.")
+    parser.add_argument("--teacher_tap_vision_layers", type=str, default="", help="Comma-separated teacher vision tap layers. Empty = auto.")
+    parser.add_argument("--teacher_tap_text_layers", type=str, default="", help="Comma-separated teacher text tap layers. Empty = auto.")
+    parser.add_argument("--teacher_tap_fp16", action="store_true", help="Run the teacher tap model in fp16 on CUDA.")
+    parser.add_argument("--teacher_tap_drop_cls", action="store_true", help="Drop vision CLS token when aligning teacher taps.")
+    parser.add_argument("--teacher_tap_w_cos", type=float, default=1.0)
+    parser.add_argument("--teacher_tap_w_stat", type=float, default=0.25)
+    parser.add_argument("--teacher_tap_w_delta", type=float, default=0.25)
 
     # clip baseline
     parser.add_argument("--clip_name", type=str, default="ViT-B/32")
@@ -732,7 +972,7 @@ def main():
     parser.add_argument("--tinyclip_ckpt", type=str, default="", help="TinyCLIP-ViT-61M-32-Text-29M-LAION400M.pt")
 
     # data
-    parser.add_argument("--cc3m_root", type=str, default="/root/autodl-tmp/cc3m")
+    parser.add_argument("--cc3m_root", type=str, default=data_defaults.cc3m_root)
     parser.add_argument("--cc3m_train_shards", type=str, default="", help="override train shards pattern (e.g. /path/train/*.tar)")
     parser.add_argument("--cc3m_val_shards", type=str, default="", help="override val shards pattern (e.g. /path/val/*.tar)")
     parser.add_argument("--shuffle_buf", type=int, default=20000)
@@ -823,7 +1063,7 @@ def main():
 
     # dist
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--backend", type=str, default="auto", help="Distributed backend: auto/nccl/hccl/gloo.")
 
     # misc
     parser.add_argument("--seed", type=int, default=42)
@@ -835,35 +1075,55 @@ def main():
 
 
     # ---- argument aliases / derived flags ----
+    args.device = str(resolve_device(args.device, allow_cpu_fallback=False))
+    args.backend = normalize_backend(args.backend, args.device)
+
     # allow --weight_decay as an alias of --wd for compatibility with other codebases
     if getattr(args, "weight_decay", None) is not None:
         args.wd = float(args.weight_decay)
 
-    # stem init from CLIP is ON by default unless explicitly disabled
-    args.stem_init_from_clip = (not getattr(args, "disable_stem_init_from_clip", False))
+    # Revised main setup: CLIPInit is kept only as a deprecated CLI surface and is forced off.
+    if getattr(args, "clip_init", False) and is_main_process():
+        print("[WARN] --clip_init is deprecated and ignored; revised ClipGene disables CLIPInit.")
+    args.clip_init = False
+    args.stem_init_from_clip = False
 
-    # ---- AMP configuration ----
-    # autocast dtype: bf16 is typically more stable than fp16.
-    if args.amp:
-        if args.amp_dtype == "auto":
-            args.amp_dtype = "bf16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "fp16"
-        if args.amp_dtype == "bf16" and (not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()):
-            if is_main_process():
-                print("[WARN] --amp_dtype bf16 requested but not supported; falling back to fp16")
-            args.amp_dtype = "fp16"
-        args._amp_autocast_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    else:
-        # value won't matter when autocast is disabled, but keep it defined.
-        args._amp_autocast_dtype = torch.float16
+    if getattr(args, "no_tleg", False):
+        args.use_tleg = False
 
-    # GradScaler is only needed for fp16. For bf16, disable scaler for stability/simplicity.
-    args._use_scaler = bool(args.amp and args._amp_autocast_dtype == torch.float16)
+    args.frozen = bool(getattr(args, "frozen", False))
+    if getattr(args, "no_frozen", False):
+        args.frozen = False
+
+    if getattr(args, "no_teacher_tap", False):
+        args.distill_mode = "none"
+    elif getattr(args, "teacher_tap", False) and getattr(args, "distill_mode", "none") == "none":
+        args.distill_mode = "tap_logit"
+    args.teacher_tap = args.distill_mode != "none"
+    if getattr(args, "teacher_tap_clip_name", "") and not getattr(args, "distill_clip_name", ""):
+        args.distill_clip_name = args.teacher_tap_clip_name
+    if float(getattr(args, "teacher_tap_weight", 0.0)) > 0:
+        args.distill_feature_weight = float(args.teacher_tap_weight)
+    args._teacher_tap_weights = SoftAlignWeights(
+        w_cos=float(getattr(args, "teacher_tap_w_cos", 1.0)),
+        w_stat=float(getattr(args, "teacher_tap_w_stat", 0.25)),
+        w_delta=float(getattr(args, "teacher_tap_w_delta", 0.25)),
+    )
+    args.distill_train_only = args.distill_mode != "none"
+
+    args._amp_autocast_dtype = resolve_amp_dtype(args.device, args.amp, args.amp_dtype)
+    args.amp_dtype = "bf16" if args._amp_autocast_dtype == torch.bfloat16 else "fp16"
+    args._use_scaler = bool(
+        args.amp
+        and args._amp_autocast_dtype == torch.float16
+        and is_accelerator_device(args.device)
+    )
 
     seed_everything(args.seed)
     mkdir(args.out_dir)
 
     if args.distributed:
-        setup_distributed(args.backend)
+        setup_distributed(args.backend, args.device)
 
     world_size = get_world_size()
 
@@ -956,9 +1216,10 @@ def main():
     bundle = create_model_bundle(args)
     model = bundle.model
     tokenize = bundle.tokenize
+    args._teacher_distiller = build_teacher_distiller_module(args)
 
     # DDP
-    if args.distributed and torch.cuda.is_available() and args.device.startswith("cuda"):
+    if args.distributed and is_accelerator_device(args.device):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -1083,7 +1344,8 @@ def main():
     optimizer = torch.optim.AdamW(param_groups, lr=args.lr, betas=(0.9, 0.98), eps=1e-6)
     # GradScaler only for fp16; bf16 does not require scaling.
     # init_scale a bit smaller for stability when unfreezing.
-    scaler = torch.cuda.amp.GradScaler(enabled=args._use_scaler, init_scale=2.0**12, growth_interval=2000)
+    scaler = make_grad_scaler(args.device, enabled=args._use_scaler, init_scale=2.0**12, growth_interval=2000)
+    args._use_scaler = scaler_is_enabled(scaler)
 
     # steps/epoch (optimizer steps)
     micro_batches_per_rank = (samples_per_rank // args.batch_size)

@@ -3,8 +3,10 @@ import os
 import torch
 import torch.distributed as dist
 
+from scripts.utils.device import normalize_backend, set_device_for_distributed
 
-def setup_distributed(backend: str = "nccl"):
+
+def setup_distributed(backend: str = "auto", device: str = "auto"):
     if dist.is_available() and dist.is_initialized():
         return
 
@@ -15,8 +17,8 @@ def setup_distributed(backend: str = "nccl"):
     else:
         rank, world_size, local_rank = 0, 1, 0
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
+    set_device_for_distributed(local_rank, device)
+    backend = normalize_backend(backend, device)
 
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     dist.barrier()

@@ -56,6 +56,7 @@ from scripts.optim import set_optimizer_lrs
 from scripts.utils.distributed import setup_distributed, get_rank, get_world_size
 from scripts.utils.misc import seed_everything, mkdir, is_main_process, unwrap_model
 from scripts.utils.checkpoint import save_checkpoint
+from tasks.dataset_registry import CIFAR100DatasetPaths
 
 # -------------------------
 # Utils
@@ -486,6 +487,7 @@ def build_transforms(image_size: int, norm: str):
 
 def main():
     parser = argparse.ArgumentParser("CIFAR-100 finetune (transfer)")
+    data_defaults = CIFAR100DatasetPaths()
 
     # model args (keep consistent with your other scripts)
     parser.add_argument("--model", type=str, default="ours")
@@ -496,7 +498,7 @@ def main():
     parser.add_argument("--gene_keywords", type=str, nargs="+", default=["learngene", "gene"])
 
     # data
-    parser.add_argument("--data_root", type=str, required=True)
+    parser.add_argument("--data_root", type=str, default=data_defaults.cifar100_root)
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--image_size", type=int, default=224)
     parser.add_argument("--norm", type=str, default="clip", choices=["clip", "imagenet"])

@@ -82,9 +82,24 @@ from scripts.optim import cosine_lr, set_optimizer_lrs
 from scripts.utils.distributed import setup_distributed, get_rank, get_world_size
 from scripts.utils.misc import seed_everything, mkdir, is_main_process, unwrap_model
 from scripts.utils.checkpoint import save_checkpoint, load_checkpoint
+from scripts.utils.device import (
+    autocast_context,
+    enable_tf32,
+    get_default_device,
+    is_accelerator_device,
+    make_grad_scaler,
+    max_memory_allocated,
+    normalize_backend,
+    reset_peak_memory_stats,
+    resolve_amp_dtype,
+    resolve_device,
+    scaler_is_enabled,
+    synchronize_device,
+)
 
 # reuse dataset logic from tasks (already in your repo)
 from tasks.matching import COCOMatchingDataset
+from tasks.dataset_registry import ITMDatasetPaths
 
 
 from tasks.common import read_json, pil_loader
@@ -195,8 +210,7 @@ class KarpathyMatchingDataset(torch.utils.data.Dataset):
 
 
 # --- TF32 ---
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+enable_tf32(True)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
@@ -272,25 +286,25 @@ def _profile_flops_latency_mem(
 
     out["flops_total"] = flops
 
-    # latency / peak memory (CUDA only)
-    if profile_speed and torch.cuda.is_available():
+    # latency / peak memory (CUDA/NPU only)
+    if profile_speed and is_accelerator_device(next(model.parameters()).device):
         device = next(model.parameters()).device
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(device)
+        synchronize_device(device)
+        reset_peak_memory_stats(device)
 
         # warmup
         for _ in range(10):
             forward_fn()
-        torch.cuda.synchronize()
+        synchronize_device(device)
 
         t0 = time.time()
         for _ in range(int(iters)):
             forward_fn()
-        torch.cuda.synchronize()
+        synchronize_device(device)
         t1 = time.time()
 
         out["latency_ms"] = 1000.0 * (t1 - t0) / float(iters)
-        out["peak_mem_mb"] = float(torch.cuda.max_memory_allocated(device)) / (1024.0**2)
+        out["peak_mem_mb"] = max_memory_allocated(device) / (1024.0**2)
 
     return out
 
@@ -389,12 +403,12 @@ def _run_profile_once(
     # optional cached text (excluded from FLOPs when using *_cached_text)
     cached_txt: Optional[torch.Tensor] = None
     if getattr(args, "flops_mode", "pair") in ("image_cached_text", "pair_cached_text"):
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+        with autocast_context(args.device, enabled=args.amp, dtype=amp_dtype):
             cached_txt = _encode_text_only(base_model, toks)
             cached_txt = F.normalize(cached_txt.float(), dim=-1)
 
     def _fw():
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+        with autocast_context(args.device, enabled=args.amp, dtype=amp_dtype):
             mode = getattr(args, "flops_mode", "pair")
             if mode == "image":
                 _ = _encode_image_only(base_model, images)
@@ -744,19 +758,15 @@ def evaluate(args, model, loader, amp_dtype: torch.dtype) -> Tuple[float, float,
     device = args.device
 
     # throughput timing
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize()
+    if is_accelerator_device(device):
+        synchronize_device(device)
     t0 = time.time()
 
     loss_fn = nn.BCEWithLogitsLoss()
 
     # throughput timing (global samples/sec, best-effort)
-    ws = get_world_size() if args.distributed else 1
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize()
-    epoch_t0 = time.time()
-    last_tp_t = epoch_t0
-    last_tp_step = global_step
+    if is_accelerator_device(device):
+        synchronize_device(device)
     loss_sum = 0.0
     n = 0
     correct05 = 0
@@ -770,7 +780,7 @@ def evaluate(args, model, loader, amp_dtype: torch.dtype) -> Tuple[float, float,
         tokens = tokens.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+        with autocast_context(device, enabled=args.amp, dtype=amp_dtype):
             img_f, txt_f = forward_features(base_model, images, tokens)
             img_f = F.normalize(img_f.float(), dim=-1)
             txt_f = F.normalize(txt_f.float(), dim=-1)
@@ -799,8 +809,8 @@ def evaluate(args, model, loader, amp_dtype: torch.dtype) -> Tuple[float, float,
 
     auc = _roc_auc_from_scores(probs_np, labels_np)
     best_thr, best_acc = _best_threshold_from_probs(probs_np, labels_np, grid=args.thr_grid)
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize()
+    if is_accelerator_device(device):
+        synchronize_device(device)
     elapsed = max(1e-12, time.time() - t0)
     throughput = float(n) / float(elapsed)
     return float(avg_loss), float(acc05), float(auc), float(best_thr), float(best_acc), float(throughput)
@@ -870,7 +880,7 @@ def train_one_epoch(
                 lrs.append(float(lr_new))
         set_optimizer_lrs(optimizer, lrs)
 
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+        with autocast_context(device, enabled=args.amp, dtype=amp_dtype):
             img_f, txt_f = forward_features(base_model, images, tokens)
             img_f = F.normalize(img_f.float(), dim=-1)
             txt_f = F.normalize(txt_f.float(), dim=-1)
@@ -912,8 +922,8 @@ def train_one_epoch(
 
             tp_str = ""
             if getattr(args, "report_throughput", 1) == 1:
-                if torch.cuda.is_available() and str(device).startswith("cuda"):
-                    torch.cuda.synchronize()
+                if is_accelerator_device(device):
+                    synchronize_device(device)
                 now = time.time()
                 dt = max(1e-12, now - last_tp_t)
                 steps = max(1, global_step - last_tp_step)
@@ -934,8 +944,8 @@ def train_one_epoch(
                 f"logit_scale={ls:.2f} p(pos)={pos_m:.3f} p(neg)={neg_m:.3f} {lr_info}{tp_str}"
             )
 
-    if torch.cuda.is_available() and str(device).startswith("cuda"):
-        torch.cuda.synchronize()
+    if is_accelerator_device(device):
+        synchronize_device(device)
     elapsed = max(1e-12, time.time() - epoch_t0)
     tp_epoch = (float(total) * float(ws)) / float(elapsed)
 
@@ -954,10 +964,11 @@ def _select_score(select_metric: str, loss: float, auc: float, best_acc: float) 
 
 def main():
     parser = argparse.ArgumentParser("Finetune ITM on COCO (ours/clip/tinyclip) + val/test + profile")
+    data_defaults = ITMDatasetPaths()
 
     # model
     parser.add_argument("--model", type=str, default="ours", choices=["ours", "clip", "tinyclip"])
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="cpu/cuda/npu/auto")
     parser.add_argument("--image_size", type=int, default=224)
 
     # ours knobs
@@ -1010,19 +1021,19 @@ def main():
     )
 
     # data
-    parser.add_argument("--coco_images", type=str, default="")
-    parser.add_argument("--coco_captions", type=str, default="")
+    parser.add_argument("--coco_images", type=str, default=data_defaults.coco_train_images)
+    parser.add_argument("--coco_captions", type=str, default=data_defaults.coco_train_captions_json)
 
     # val
-    parser.add_argument("--coco_val_images", type=str, default="")
-    parser.add_argument("--coco_val_captions", type=str, default="")
+    parser.add_argument("--coco_val_images", type=str, default=data_defaults.coco_val_images)
+    parser.add_argument("--coco_val_captions", type=str, default=data_defaults.coco_val_captions_json)
     parser.add_argument("--val_every", type=int, default=1)
     parser.add_argument("--val_batch_size", type=int, default=256)
     parser.add_argument("--thr_grid", type=int, default=201)
 
     # test (融入微调流程)
-    parser.add_argument("--coco_test_images", type=str, default="")
-    parser.add_argument("--coco_test_captions", type=str, default="")
+    parser.add_argument("--coco_test_images", type=str, default=data_defaults.coco_test_images)
+    parser.add_argument("--coco_test_captions", type=str, default=data_defaults.coco_test_captions_json)
     parser.add_argument("--eval_test", type=int, default=1, choices=[0, 1],
                         help="1: run test evaluation along with val; 0: disable test")
     parser.add_argument("--test_when_best", action="store_true",
@@ -1031,8 +1042,8 @@ def main():
                         help="Which val metric defines 'best' checkpoint.")
 
     # cross-dataset generalization (Flickr30k, Karpathy json)
-    parser.add_argument("--flickr_images", type=str, default="", help="Flickr30k images root (folder with *.jpg)")
-    parser.add_argument("--flickr_karpathy_json", type=str, default="", help="Flickr30k Karpathy-style JSON (dataset_flickr30k.json)")
+    parser.add_argument("--flickr_images", type=str, default=data_defaults.flickr_images, help="Flickr30k images root (folder with *.jpg)")
+    parser.add_argument("--flickr_karpathy_json", type=str, default=data_defaults.flickr_karpathy_json, help="Flickr30k Karpathy-style JSON (dataset_flickr30k.json)")
     parser.add_argument("--eval_flickr", type=int, default=1, choices=[0, 1],
                         help="1: run Flickr30k eval for cross-dataset generalization when paths are provided.")
     parser.add_argument("--flickr_eval_splits", type=str, nargs="+", default=["val", "test"])
@@ -1066,7 +1077,7 @@ def main():
 
     # dist
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--backend", type=str, default="auto", help="Distributed backend: auto/nccl/hccl/gloo.")
 
     # profile (lightweight advantage metrics)
     parser.add_argument("--skip_profile", action="store_true")
@@ -1100,8 +1111,10 @@ def main():
 
     args = parser.parse_args()
 
-    # ours: default stem init is ON unless explicitly disabled
-    args.stem_init_from_clip = (not getattr(args, 'disable_stem_init_from_clip', False))
+    args.device = str(resolve_device(args.device, allow_cpu_fallback=False))
+    args.backend = normalize_backend(args.backend, args.device)
+    # Revised main setup: CLIPInit is disabled for downstream experiments too.
+    args.stem_init_from_clip = False
     if getattr(args, 'no_tleg', False):
         args.use_tleg = False
 
@@ -1110,23 +1123,13 @@ def main():
     if (args.eval_flickr == 1) and (not args._has_flickr) and is_main_process():
         print("[FLICKR] eval_flickr=1 but flickr paths not provided; Flickr eval disabled.")
 
-    # AMP dtype resolve
-    if args.amp:
-        if args.amp_dtype == "auto":
-            args.amp_dtype = "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp16"
-        if args.amp_dtype == "bf16" and not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
-            if is_main_process():
-                print("[WARN] bf16 not supported; fallback to fp16")
-            args.amp_dtype = "fp16"
-        amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    else:
-        amp_dtype = torch.float16  # unused when amp disabled
-
-    # scaler only for fp16
-    scaler = None
-    if args.amp and args.amp_dtype == "fp16":
-        scaler = torch.cuda.amp.GradScaler(enabled=True)
-    else:
+    amp_dtype = resolve_amp_dtype(args.device, args.amp, args.amp_dtype)
+    args.amp_dtype = "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+    scaler = make_grad_scaler(
+        args.device,
+        enabled=(args.amp and amp_dtype == torch.float16 and is_accelerator_device(args.device)),
+    )
+    if not scaler_is_enabled(scaler):
         scaler = None
 
     # CLIP-safe defaults if user didn't specify
@@ -1144,7 +1147,7 @@ def main():
     mkdir(args.out_dir)
 
     if args.distributed:
-        setup_distributed(args.backend)
+        setup_distributed(args.backend, args.device)
 
     # data arg validation
     if args.eval_only:
@@ -1162,7 +1165,7 @@ def main():
     model = bundle.model
     tokenize = bundle.tokenize
 
-    if args.distributed and torch.cuda.is_available() and str(args.device).startswith("cuda"):
+    if args.distributed and is_accelerator_device(args.device):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = torch.nn.parallel.DistributedDataParallel(
             model,

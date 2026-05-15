@@ -59,6 +59,41 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 
+class ResidualConvBlock(nn.Module):
+    """
+    Lightweight residual 1D-conv block over token sequences.
+
+    Input / output shape: [seq, batch, d_model]
+    The convolution runs on the sequence dimension and preserves width.
+    """
+    def __init__(self, d_model: int, kernel_size: int = 3, expansion: int = 2):
+        super().__init__()
+        if kernel_size <= 0 or kernel_size % 2 == 0:
+            raise ValueError(f"kernel_size must be a positive odd integer, got {kernel_size}")
+
+        hidden = max(d_model, int(d_model * expansion))
+        padding = kernel_size // 2
+
+        self.ln = LayerNormFP32(d_model)
+        self.conv_dw = nn.Conv1d(d_model, d_model, kernel_size=kernel_size, padding=padding, groups=d_model)
+        self.conv_pw1 = nn.Conv1d(d_model, hidden, kernel_size=1)
+        self.act = QuickGELU()
+        self.conv_pw2 = nn.Conv1d(hidden, d_model, kernel_size=1)
+
+        # Start from near-identity to keep early optimization stable.
+        nn.init.zeros_(self.conv_pw2.weight)
+        if self.conv_pw2.bias is not None:
+            nn.init.zeros_(self.conv_pw2.bias)
+
+    def forward(self, x: torch.Tensor):
+        y = self.ln(x).permute(1, 2, 0)  # [B, D, Seq]
+        y = self.conv_dw(y)
+        y = self.conv_pw1(y)
+        y = self.act(y)
+        y = self.conv_pw2(y)
+        return x + y.permute(2, 0, 1)
+
+
 class BottleneckMLP(nn.Module):
     """
     Token-wise bottleneck MLP between shallow blocks and learngene.

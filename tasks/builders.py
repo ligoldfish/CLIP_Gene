@@ -6,6 +6,7 @@ from .retrieval import build_retrieval_datasets
 from .matching import build_itm_loader
 from .coco_multilabel import build_multilabel_loader
 from .zero_shot_imagenet import build_imagenet_val_loader, load_imagenet_classnames, build_zeroshot_classifier
+from .dataset_registry import get_task_dataset_placeholders
 
 
 def build_task_retrieval(adapter, root: str, karpathy_json: str, split: str = "val"):
@@ -33,3 +34,7 @@ def build_task_zeroshot_imagenet(adapter, imagenet_val_dir: str, classnames_txt:
     ds, loader = build_imagenet_val_loader(adapter, imagenet_val_dir, batch_size, num_workers)
     W = build_zeroshot_classifier(adapter, classnames)
     return ds, loader, W
+
+
+def build_task_dataset_placeholders() -> Dict[str, Dict[str, str]]:
+    return get_task_dataset_placeholders()

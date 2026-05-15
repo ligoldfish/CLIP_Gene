@@ -10,11 +10,13 @@ import torch.nn.functional as F
 from .blocks import (
     LayerNormFP32,
     ResidualAttentionBlock,
+    ResidualConvBlock,
     BottleneckMLP,
     ProjectionHead,
     build_causal_attention_mask,
 )
 from .learngene_loader import load_learngene_variant, load_multimodal_state
+from scripts.utils.device import get_default_device
 
 
 @dataclass
@@ -27,6 +29,8 @@ class StudentCLIPConfig:
 
     # architecture
     shallow_layers: int = 2
+    shallow_type: str = "transformer"
+    shallow_kernel_size: int = 3
     bottleneck_dim: Optional[int] = None
     bottleneck_dropout: float = 0.0
 
@@ -111,6 +115,8 @@ class Tower(nn.Module):
         width: int,
         n_head: int,
         shallow_layers: int,
+        shallow_type: str,
+        shallow_kernel_size: int,
         bottleneck_dim: Optional[int],
         bottleneck_dropout: float,
         gene_module: nn.Module,
@@ -125,11 +131,20 @@ class Tower(nn.Module):
         self.width = width
         self.n_head = n_head
         self.is_text = is_text
+        self.shallow_type = str(shallow_type).lower()
 
-        self.shallow = nn.ModuleList([
-            ResidualAttentionBlock(d_model=width, n_head=n_head, attn_mask=attn_mask if is_text else None)
-            for _ in range(shallow_layers)
-        ])
+        if self.shallow_type == "transformer":
+            self.shallow = nn.ModuleList([
+                ResidualAttentionBlock(d_model=width, n_head=n_head, attn_mask=attn_mask if is_text else None)
+                for _ in range(shallow_layers)
+            ])
+        elif self.shallow_type == "cnn":
+            self.shallow = nn.ModuleList([
+                ResidualConvBlock(d_model=width, kernel_size=shallow_kernel_size)
+                for _ in range(shallow_layers)
+            ])
+        else:
+            raise ValueError(f"Unsupported shallow_type={shallow_type!r}. Expected 'transformer' or 'cnn'.")
 
         self.bottleneck = BottleneckMLP(d_model=width, bottleneck=bottleneck_dim, dropout=bottleneck_dropout)
         self.gene = gene_module
@@ -206,7 +221,7 @@ class StudentCLIP(nn.Module):
         assert cfg.gene_variant_dir, "cfg.gene_variant_dir is required"
 
         if device is None:
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = get_default_device()
         dev = torch.device(device)
         self.dtype = dtype
         self.cfg = cfg
@@ -251,6 +266,8 @@ class StudentCLIP(nn.Module):
             width=width_v,
             n_head=head_v,
             shallow_layers=cfg.shallow_layers,
+            shallow_type=cfg.shallow_type,
+            shallow_kernel_size=cfg.shallow_kernel_size,
             bottleneck_dim=cfg.bottleneck_dim,
             bottleneck_dropout=cfg.bottleneck_dropout,
             gene_module=gene_v,
@@ -266,6 +283,8 @@ class StudentCLIP(nn.Module):
             width=width_t,
             n_head=head_t,
             shallow_layers=cfg.shallow_layers,
+            shallow_type=cfg.shallow_type,
+            shallow_kernel_size=cfg.shallow_kernel_size,
             bottleneck_dim=cfg.bottleneck_dim,
             bottleneck_dropout=cfg.bottleneck_dropout,
             gene_module=gene_t,
@@ -361,7 +380,7 @@ class StudentCLIP(nn.Module):
             # ---- strengthen text tower init (keep depth unchanged) ----
             # Initialize student text shallow blocks from teacher CLIP transformer blocks
             try:
-                if hasattr(teacher, 'transformer') and hasattr(teacher.transformer, 'resblocks'):
+                if self.text_tower.shallow_type == "transformer" and hasattr(teacher, 'transformer') and hasattr(teacher.transformer, 'resblocks'):
                     src_blocks = list(teacher.transformer.resblocks)
                     dst_blocks = list(self.text_tower.shallow)  # ModuleList
                     n = min(self.cfg.shallow_layers, len(dst_blocks), len(src_blocks))
@@ -374,7 +393,7 @@ class StudentCLIP(nn.Module):
             # ---- strengthen vision tower init (keep depth unchanged) ----
             # Initialize student vision shallow blocks from teacher CLIP visual transformer blocks
             try:
-                if hasattr(teacher, 'visual') and hasattr(teacher.visual, 'transformer') and hasattr(teacher.visual.transformer, 'resblocks'):
+                if self.vision_tower.shallow_type == "transformer" and hasattr(teacher, 'visual') and hasattr(teacher.visual, 'transformer') and hasattr(teacher.visual.transformer, 'resblocks'):
                     src_blocks = list(teacher.visual.transformer.resblocks)
                     dst_blocks = list(self.vision_tower.shallow)  # ModuleList
                     n_copy = min(self.cfg.shallow_layers, len(src_blocks), len(dst_blocks))
@@ -457,16 +476,39 @@ class StudentCLIP(nn.Module):
                 p.requires_grad = False
 
     def forward(self, image: torch.Tensor, text: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # tokens
-        v_tokens = self.vision_stem(image.to(next(self.vision_stem.parameters()).device, dtype=self.dtype))
-        t_tokens = self.text_stem(text.to(next(self.text_stem.parameters()).device))
-
-        # embeddings in shared low-dim space
-        z_img = self.vision_tower(v_tokens)              # [B, proj_dim]
-        z_txt = self.text_tower(t_tokens, text=text)     # [B, proj_dim]
+        z_img = self.encode_image(image)
+        z_txt = self.encode_text(text)
 
         # logits
         logit_scale = self.logit_scale.exp().clamp(max=100.0)
         logits_per_image = logit_scale * (z_img @ z_txt.t())
         logits_per_text = logits_per_image.t()
         return logits_per_image, logits_per_text
+
+    def encode_image(self, image: torch.Tensor) -> torch.Tensor:
+        v_tokens = self.vision_stem(image.to(next(self.vision_stem.parameters()).device, dtype=self.dtype))
+        return self.vision_tower(v_tokens)
+
+    def encode_text(self, text: torch.Tensor) -> torch.Tensor:
+        t_tokens = self.text_stem(text.to(next(self.text_stem.parameters()).device))
+        return self.text_tower(t_tokens, text=text)
+
+    def encode_image_with_aux(self, image: torch.Tensor):
+        v_tokens = self.vision_stem(image.to(next(self.vision_stem.parameters()).device, dtype=self.dtype))
+        return self.vision_tower.forward_with_aux(v_tokens)
+
+    def encode_text_with_aux(self, text: torch.Tensor):
+        t_tokens = self.text_stem(text.to(next(self.text_stem.parameters()).device))
+        return self.text_tower.forward_with_aux(t_tokens, text=text)
+
+    def forward_with_aux(self, image: torch.Tensor, text: torch.Tensor):
+        z_img, v_aux = self.encode_image_with_aux(image)
+        z_txt, t_aux = self.encode_text_with_aux(text)
+        logit_scale = self.logit_scale.exp().clamp(max=100.0)
+        logits_per_image = logit_scale * (z_img @ z_txt.t())
+        logits_per_text = logits_per_image.t()
+        aux = {
+            "vision": v_aux,
+            "text": t_aux,
+        }
+        return logits_per_image, logits_per_text, aux

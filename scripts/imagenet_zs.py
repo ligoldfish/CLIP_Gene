@@ -51,6 +51,7 @@ from scripts.data.transforms import build_clip_image_transform
 from scripts.model_factory import create_model_bundle
 from scripts.utils.distributed import setup_distributed, get_rank, get_world_size
 from scripts.utils.misc import seed_everything, mkdir, is_main_process, unwrap_model
+from tasks.dataset_registry import ImageNetDatasetPaths
 
 # torch 2.x flop counter
 # ---- FLOPs backends (torch flop_counter / fvcore / thop) ----
@@ -490,6 +491,7 @@ def estimate_flops_per_image(base_model: nn.Module, device: torch.device, image_
 
 def main():
     parser = argparse.ArgumentParser("ImageNet-1K zero-shot eval (top1/top5) with prompt ensemble & metrics")
+    data_defaults = ImageNetDatasetPaths()
 
     # model selection (match your repo)
     parser.add_argument("--model", type=str, default="ours", choices=["ours", "clip", "tinyclip"])
@@ -528,11 +530,11 @@ def main():
     parser.add_argument("--tinyclip_ckpt", type=str, default="")
 
     # data: flat val + label file
-    parser.add_argument("--imagenet_val_dir", type=str, required=True, help="val folder containing only images")
-    parser.add_argument("--imagenet_val_labels", type=str, required=True, help="label file: '<filename> <synset>' per line")
+    parser.add_argument("--imagenet_val_dir", type=str, default=data_defaults.imagenet_val_dir, help="val folder containing only images")
+    parser.add_argument("--imagenet_val_labels", type=str, default=data_defaults.imagenet_val_labels, help="label file: '<filename> <synset>' per line")
 
     # class mapping (for best zero-shot prompts)
-    parser.add_argument("--class_index_json", type=str, default="", help="imagenet_class_index.json (Keras-style)")
+    parser.add_argument("--class_index_json", type=str, default=data_defaults.class_index_json, help="imagenet_class_index.json (Keras-style)")
     parser.add_argument("--use_synset_as_classname", action="store_true",
                         help="If no class_index_json, use synset id as prompt text (worse accuracy).")
 

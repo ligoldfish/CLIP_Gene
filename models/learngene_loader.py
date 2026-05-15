@@ -184,6 +184,8 @@ class LearngeneModule(nn.Module):
         super().__init__()
         self.blocks = blocks
         self.original_layer_indices = original_layer_indices
+        self.is_tleg = False
+        self.tleg_active = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         for blk in self.blocks:
@@ -192,6 +194,45 @@ class LearngeneModule(nn.Module):
 
     def set_requires_grad(self, flag: bool = True):
         """Keep compatibility with old code (StudentCLIP expects this)."""
+        for p in self.parameters():
+            p.requires_grad_(flag)
+        return self
+
+    def set_tleg_active(self, flag: bool = True):
+        self.tleg_active = bool(flag)
+        return self
+
+
+class SwitchableTLEGLearngeneModule(nn.Module):
+    """
+    Non-strict TLEG module that can switch between:
+      - base learnt gene blocks
+      - expanded TLEG blocks
+    """
+    def __init__(
+        self,
+        base_blocks: nn.ModuleList,
+        expanded_blocks: nn.ModuleList,
+        original_layer_indices: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.base_blocks = base_blocks
+        self.expanded_blocks = expanded_blocks
+        self.original_layer_indices = original_layer_indices
+        self.is_tleg = True
+        self.tleg_active = True
+
+    def set_tleg_active(self, flag: bool = True):
+        self.tleg_active = bool(flag)
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        blocks = self.expanded_blocks if self.tleg_active else self.base_blocks
+        for blk in blocks:
+            x = blk(x)
+        return x
+
+    def set_requires_grad(self, flag: bool = True):
         for p in self.parameters():
             p.requires_grad_(flag)
         return self
@@ -206,6 +247,7 @@ class TLEGStrictPiecewiseModule(nn.Module):
     def __init__(
         self,
         expanded_layers: List[Dict[str, torch.Tensor]],
+        base_blocks: Optional[nn.ModuleList],
         d_model: int,
         n_head: int,
         attn_mask: Optional[torch.Tensor] = None,
@@ -221,7 +263,10 @@ class TLEGStrictPiecewiseModule(nn.Module):
         # In DDP / multi-GPU training, we must ensure the layer state dicts and template
         # live on the same device as the activation tensor `x`.
         self.expanded_layers = expanded_layers
+        self.base_blocks = base_blocks
         self.template = _new_resblock(d_model, n_head, attn_mask=attn_mask, device=device, dtype=dtype)
+        self.is_tleg = True
+        self.tleg_active = True
 
         # cache per-device moved state_dicts (each torchrun rank uses a single GPU)
         self._cached_device: Optional[torch.device] = None
@@ -244,6 +289,13 @@ class TLEGStrictPiecewiseModule(nn.Module):
         self._cached_device = device
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.tleg_active:
+            if self.base_blocks is None:
+                return x
+            for blk in self.base_blocks:
+                x = blk(x)
+            return x
+
         dev = x.device
 
         # Make sure template (and any internal buffers like attn_mask) is on the same device.
@@ -258,6 +310,10 @@ class TLEGStrictPiecewiseModule(nn.Module):
         for sd in self._cached_expanded_layers:
             x = _functional_call(self.template, sd, (x,), {})
         return x
+
+    def set_tleg_active(self, flag: bool = True):
+        self.tleg_active = bool(flag)
+        return self
 
 
     def set_requires_grad(self, flag: bool = True):
@@ -354,6 +410,7 @@ def load_learngene_variant(
         if tleg_strict:
             gene = TLEGStrictPiecewiseModule(
                 expanded_layers=expanded_layers,
+                base_blocks=base_blocks,
                 d_model=width,
                 n_head=heads,
                 attn_mask=attn_mask,
@@ -367,7 +424,11 @@ def load_learngene_variant(
             ])
             for blk, sd_i in zip(exp_blocks, expanded_layers):
                 blk.load_state_dict(sd_i, strict=True)
-            gene = LearngeneModule(exp_blocks, original_layer_indices=[int(x) for x in layers])
+            gene = SwitchableTLEGLearngeneModule(
+                base_blocks=base_blocks,
+                expanded_blocks=exp_blocks,
+                original_layer_indices=[int(x) for x in layers],
+            )
     else:
         gene = LearngeneModule(base_blocks, original_layer_indices=[int(x) for x in layers])
 

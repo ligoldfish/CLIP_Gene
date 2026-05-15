@@ -60,6 +60,17 @@ from scripts.optim import cosine_lr, set_optimizer_lrs
 from scripts.utils.distributed import setup_distributed, get_rank, get_world_size
 from scripts.utils.misc import seed_everything, mkdir, is_main_process, unwrap_model
 from scripts.utils.checkpoint import save_checkpoint, load_checkpoint
+from scripts.utils.device import (
+    autocast_context,
+    enable_tf32,
+    get_default_device,
+    is_accelerator_device,
+    make_grad_scaler,
+    normalize_backend,
+    resolve_amp_dtype,
+    resolve_device,
+    scaler_is_enabled,
+)
 # NOTE: tasks/retrieval.py in this repo exposes a *feature-level* API:
 #   - build_retrieval_datasets(img_root, karpathy_json, split)
 #   - encode_all_images / encode_all_texts (adapter -> features)
@@ -70,13 +81,12 @@ from tasks.retrieval import (
     encode_all_texts,
     compute_retrieval_metrics,
 )
+from tasks.dataset_registry import RetrievalDatasetPaths, is_placeholder_path
 from scripts.finetune_common import FinetunedModelAdapter
 from scripts.utils.profile import count_params, profile_clip_like
 
 
-# --- TF32 (Ampere/Ada/Hopper GPUs) ---
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+enable_tf32(True)
 try:
     torch.set_float32_matmul_precision("high")
 except Exception:
@@ -178,21 +188,17 @@ def build_optimizer(args, base_model: nn.Module) -> Tuple[torch.optim.Optimizer,
     return optimizer, []
 
 
-def _resolve_amp_dtype(args) -> Tuple[torch.dtype, Optional[torch.cuda.amp.GradScaler]]:
+def _resolve_amp_dtype(args) -> Tuple[torch.dtype, Optional[object]]:
     if not args.amp:
         return torch.float16, None
 
-    if args.amp_dtype == "auto":
-        args.amp_dtype = "bf16" if (torch.cuda.is_available() and torch.cuda.is_bf16_supported()) else "fp16"
-
-    if args.amp_dtype == "bf16" and not (torch.cuda.is_available() and torch.cuda.is_bf16_supported()):
-        if is_main_process():
-            print("[WARN] bf16 not supported; fallback to fp16")
-        args.amp_dtype = "fp16"
-
-    amp_dtype = torch.bfloat16 if args.amp_dtype == "bf16" else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.amp and args.amp_dtype == "fp16"))
-    if not scaler.is_enabled():
+    amp_dtype = resolve_amp_dtype(args.device, args.amp, args.amp_dtype)
+    args.amp_dtype = "bf16" if amp_dtype == torch.bfloat16 else "fp16"
+    scaler = make_grad_scaler(
+        args.device,
+        enabled=(args.amp and amp_dtype == torch.float16 and is_accelerator_device(args.device)),
+    )
+    if not scaler_is_enabled(scaler):
         scaler = None
     return amp_dtype, scaler
 
@@ -248,7 +254,7 @@ def train_one_epoch(
             set_optimizer_lrs(optimizer, [lr_new, gene_lr])
             lr_gene = gene_lr
 
-        with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+        with autocast_context(device, enabled=args.amp, dtype=amp_dtype):
             img_f, txt_f = forward_features(base_model, images, tokens)
             logit_scale = get_logit_scale(base_model)
             loss = clip_contrastive_loss(img_f, txt_f, logit_scale)
@@ -364,10 +370,11 @@ def run_retrieval_eval(args, model, tokenize) -> Dict[str, Any]:
 
 def main():
     parser = argparse.ArgumentParser("Finetune Retrieval (contrastive) on COCO+Flickr (ours/clip/tinyclip)")
+    retrieval_defaults = RetrievalDatasetPaths()
 
     # model
     parser.add_argument("--model", type=str, default="ours", choices=["ours", "clip", "tinyclip"])
-    parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--device", type=str, default=get_default_device(), help="cpu/cuda/npu/auto")
     parser.add_argument("--image_size", type=int, default=224)
 
     # eval-only
@@ -377,6 +384,8 @@ def main():
     # ours knobs
     parser.add_argument("--gene_dir", type=str, default="", help="folder containing learngene_visual.pt / learngene_text.pt ...")
     parser.add_argument("--shallow_layers", type=int, default=3)
+    parser.add_argument("--shallow_type", type=str, default="transformer", choices=["transformer", "cnn"])
+    parser.add_argument("--shallow_kernel_size", type=int, default=3)
     parser.add_argument("--bottleneck_dim", type=int, default=-1)
     parser.add_argument("--bottleneck_dropout", type=float, default=0.0)
     parser.add_argument("--proj_dim", type=int, default=512)
@@ -392,6 +401,8 @@ def main():
     parser.add_argument("--use_multimodal_init", action="store_true")
 
     # CLIP stem init (ours)
+    parser.add_argument("--clip_init", action="store_true")
+    parser.add_argument("--no_clip_init", action="store_true")
     parser.add_argument("--disable_stem_init_from_clip", action="store_true")
     parser.add_argument("--stem_init_clip_name", type=str, default="ViT-B/32")
     parser.add_argument("--freeze_stem_after_init", action="store_true")
@@ -404,10 +415,10 @@ def main():
     parser.add_argument("--init_ckpt", type=str, default="", help="optional init checkpoint (ckpt_last.pt or model_last.pt)")
 
     # data (training)
-    parser.add_argument("--coco_images", type=str, default="")
-    parser.add_argument("--coco_captions", type=str, default="")
-    parser.add_argument("--flickr_images", type=str, default="")
-    parser.add_argument("--flickr_ann", type=str, default="")
+    parser.add_argument("--coco_images", type=str, default=retrieval_defaults.coco_images)
+    parser.add_argument("--coco_captions", type=str, default=retrieval_defaults.coco_captions_json)
+    parser.add_argument("--flickr_images", type=str, default=retrieval_defaults.flickr_images)
+    parser.add_argument("--flickr_ann", type=str, default=retrieval_defaults.flickr_karpathy_json)
     parser.add_argument("--flickr_split", type=str, default="train")
 
     parser.add_argument("--coco_max", type=int, default=-1)
@@ -416,10 +427,10 @@ def main():
     parser.add_argument("--mix_length", type=int, default=-1)
 
     # eval (retrieval)
-    parser.add_argument("--eval_coco_images", type=str, default="")
-    parser.add_argument("--eval_coco_karpathy_json", type=str, default="")
-    parser.add_argument("--eval_flickr_images", type=str, default="")
-    parser.add_argument("--eval_flickr_karpathy_json", type=str, default="")
+    parser.add_argument("--eval_coco_images", type=str, default=retrieval_defaults.coco_images)
+    parser.add_argument("--eval_coco_karpathy_json", type=str, default=retrieval_defaults.coco_karpathy_json)
+    parser.add_argument("--eval_flickr_images", type=str, default=retrieval_defaults.flickr_images)
+    parser.add_argument("--eval_flickr_karpathy_json", type=str, default=retrieval_defaults.flickr_karpathy_json)
     parser.add_argument("--eval_splits", type=str, nargs="+", default=["val", "test"])
     parser.add_argument("--eval_every", type=int, default=1)
     parser.add_argument("--eval_batch_size", type=int, default=256)
@@ -446,6 +457,8 @@ def main():
 
     # freeze/unfreeze gene (ours)
     parser.add_argument("--freeze_gene", action="store_true", help="freeze learngene for entire finetune (recommended)")
+    parser.add_argument("--frozen", action="store_true", help="Alias of --freeze_gene for ablation sweeps.")
+    parser.add_argument("--no_frozen", action="store_true")
     parser.add_argument("--unfreeze_epoch", type=int, default=2)
     parser.add_argument("--gene_lr_ratio", type=float, default=10.0)
     parser.add_argument("--gene_warmup_steps", type=int, default=200)
@@ -453,7 +466,7 @@ def main():
 
     # dist
     parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--backend", type=str, default="nccl")
+    parser.add_argument("--backend", type=str, default="auto", help="Distributed backend: auto/nccl/hccl/gloo.")
 
     # misc
     parser.add_argument("--seed", type=int, default=42)
@@ -464,9 +477,15 @@ def main():
 
     args = parser.parse_args()
 
-    args.stem_init_from_clip = (not getattr(args, 'disable_stem_init_from_clip', False))
+    args.device = str(resolve_device(args.device, allow_cpu_fallback=False))
+    args.backend = normalize_backend(args.backend, args.device)
+    args.clip_init = False
+    args.stem_init_from_clip = False
     if getattr(args, 'no_tleg', False):
         args.use_tleg = False
+    args.freeze_gene = bool(getattr(args, "freeze_gene", False) or getattr(args, "frozen", False))
+    if getattr(args, "no_frozen", False):
+        args.freeze_gene = False
 
     amp_dtype, scaler = _resolve_amp_dtype(args)
     # pass resolved torch.dtype to evaluation adapter (avoid string dtype bugs)
@@ -476,27 +495,43 @@ def main():
     mkdir(args.out_dir)
 
     if args.distributed:
-        setup_distributed(args.backend)
+        setup_distributed(args.backend, args.device)
 
     if args.model == "ours" and not args.gene_dir:
         raise ValueError("--gene_dir is required for --model ours")
 
     if args.eval_only:
-        if not ((args.eval_coco_images and args.eval_coco_karpathy_json) or (args.eval_flickr_images and args.eval_flickr_karpathy_json)):
+        has_coco_eval = (
+            args.eval_coco_images and args.eval_coco_karpathy_json
+            and not is_placeholder_path(args.eval_coco_images)
+            and not is_placeholder_path(args.eval_coco_karpathy_json)
+        )
+        has_flickr_eval = (
+            args.eval_flickr_images and args.eval_flickr_karpathy_json
+            and not is_placeholder_path(args.eval_flickr_images)
+            and not is_placeholder_path(args.eval_flickr_karpathy_json)
+        )
+        if not (has_coco_eval or has_flickr_eval):
             raise ValueError("--eval_only requires at least one eval spec: "
                              "(--eval_coco_images & --eval_coco_karpathy_json) or "
                              "(--eval_flickr_images & --eval_flickr_karpathy_json)")
         if args.model == "tinyclip" and (not args.init_ckpt) and (not args.tinyclip_ckpt):
             raise ValueError("--model tinyclip requires --tinyclip_ckpt or --init_ckpt for --eval_only")
     else:
-        if not (args.coco_images and args.coco_captions and args.flickr_images and args.flickr_ann):
+        if not (
+            args.coco_images and args.coco_captions and args.flickr_images and args.flickr_ann
+            and not is_placeholder_path(args.coco_images)
+            and not is_placeholder_path(args.coco_captions)
+            and not is_placeholder_path(args.flickr_images)
+            and not is_placeholder_path(args.flickr_ann)
+        ):
             raise ValueError("Training requires --coco_images --coco_captions --flickr_images --flickr_ann")
 
     bundle = create_model_bundle(args)
     model = bundle.model
     tokenize = bundle.tokenize
 
-    if args.distributed and torch.cuda.is_available() and str(args.device).startswith("cuda"):
+    if args.distributed and is_accelerator_device(args.device):
         local_rank = int(os.environ.get("LOCAL_RANK", 0))
         model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[local_rank], find_unused_parameters=True)
 
@@ -516,7 +551,7 @@ def main():
             toks = torch.zeros(1, context_len, dtype=torch.long, device=args.device)
 
             def _fw():
-                with torch.cuda.amp.autocast(enabled=args.amp, dtype=amp_dtype):
+                with autocast_context(args.device, enabled=args.amp, dtype=amp_dtype):
                     forward_features(base_model, images, toks)
 
             p = count_params(base_model)

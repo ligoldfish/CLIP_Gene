@@ -78,9 +78,20 @@ def create_model_bundle(args) -> ModelBundle:
                 return 32
             return 32
 
-        # pick a CLIP name to infer ViT patch size (prefer teacher used for stem init)
+        # Pick a CLIP name to infer ViT patch size. CLIPInit itself is opt-in/deprecated.
         _ref_clip_name = getattr(args, "stem_init_clip_name", "") or getattr(args, "clip_name", "ViT-B/32")
         _image_size = int(getattr(args, "image_size", getattr(args, "image_resolution", 224)) or 224)
+        _clip_init = bool(getattr(args, "stem_init_from_clip", False))
+        if bool(getattr(args, "clip_init", False)):
+            _clip_init = True
+        if bool(getattr(args, "disable_stem_init_from_clip", False)) or bool(getattr(args, "no_clip_init", False)):
+            _clip_init = False
+        _use_tleg = bool(getattr(args, "use_tleg", False))
+        if bool(getattr(args, "no_tleg", False)):
+            _use_tleg = False
+        _freeze_gene = getattr(args, "frozen", None)
+        if _freeze_gene is None:
+            _freeze_gene = True
 
         # Build cfg with attribute access (Namespace/dataclass style)
         cfg_dict = {
@@ -98,6 +109,8 @@ def create_model_bundle(args) -> ModelBundle:
 
             # architecture knobs (safe defaults)
             "shallow_layers": args.shallow_layers,
+            "shallow_type": getattr(args, "shallow_type", "transformer"),
+            "shallow_kernel_size": int(getattr(args, "shallow_kernel_size", 3)),
             "bottleneck_dim": None if args.bottleneck_dim <= 0 else args.bottleneck_dim,
             "bottleneck_dropout": args.bottleneck_dropout,
 
@@ -107,7 +120,7 @@ def create_model_bundle(args) -> ModelBundle:
             "proj_dropout": args.proj_dropout,
 
             # TLEG
-            "use_tleg": args.use_tleg,
+            "use_tleg": _use_tleg,
             "tleg_target_depth": args.tleg_target_depth,
             "tleg_strict": getattr(args, "tleg_strict", False),
 
@@ -115,13 +128,13 @@ def create_model_bundle(args) -> ModelBundle:
             "use_multimodal_init": args.use_multimodal_init,
 
 
-            # CLIP stem initialization (copy vision/text stems + ln_post from teacher CLIP)
-            "stem_init_from_clip": bool(getattr(args, "stem_init_from_clip", (not getattr(args, "disable_stem_init_from_clip", False)))),
+            # Deprecated CLIP stem initialization; revised main experiments keep this false.
+            "stem_init_from_clip": bool(_clip_init),
             "stem_init_clip_name": getattr(args, "stem_init_clip_name", "ViT-B/32"),
             "freeze_stem_after_init": bool(getattr(args, "freeze_stem_after_init", False)),
 
-            # start frozen; training loop will unfreeze later
-            "freeze_learngene": True,
+            # start frozen by default; training loop may unfreeze later
+            "freeze_learngene": bool(_freeze_gene),
         }
 
         # If your project defines a StudentCLIPConfig dataclass, use it; otherwise fallback to SimpleNamespace

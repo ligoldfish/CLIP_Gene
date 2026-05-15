@@ -6,6 +6,8 @@ from typing import Callable, Dict, Optional
 import torch
 import torch.nn as nn
 
+from scripts.utils.device import is_accelerator_device, max_memory_allocated, reset_peak_memory_stats, synchronize_device
+
 def count_params(model: nn.Module) -> Dict[str, int]:
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -38,23 +40,25 @@ def profile_clip_like(
         out["flops_total"] = None
 
     # -------- Latency / PeakMem (可选) --------
-    if profile_speed and torch.cuda.is_available():
+    if profile_speed:
         device = next(model.parameters()).device
-        torch.cuda.synchronize(device)
-        torch.cuda.reset_peak_memory_stats(device)
+        if not is_accelerator_device(device):
+            return out
+        synchronize_device(device)
+        reset_peak_memory_stats(device)
 
         # warmup
         for _ in range(10):
             forward_fn()
-        torch.cuda.synchronize(device)
+        synchronize_device(device)
 
         t0 = time.time()
         for _ in range(int(iters)):
             forward_fn()
-        torch.cuda.synchronize(device)
+        synchronize_device(device)
         t1 = time.time()
 
         out["latency_ms"] = 1000.0 * (t1 - t0) / float(iters)
-        out["peak_mem_mb"] = float(torch.cuda.max_memory_allocated(device)) / (1024.0**2)
+        out["peak_mem_mb"] = max_memory_allocated(device) / (1024.0**2)
 
     return out

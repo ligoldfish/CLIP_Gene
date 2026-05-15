@@ -29,6 +29,8 @@ from typing import Dict, List
 import torch
 import clip
 
+from scripts.utils.device import get_default_device, resolve_device
+
 
 def ensure_vit_clip(model):
     if not hasattr(model, "visual") or not hasattr(model.visual, "transformer") or not hasattr(model.visual.transformer, "resblocks"):
@@ -129,11 +131,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out_root", type=str, required=True, help="root folder that will contain last2/last3/last2_plus6")
     ap.add_argument("--clip_model", type=str, default="ViT-B/32")
-    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--device", type=str, default=get_default_device(), help="cpu/cuda/npu/auto")
     ap.add_argument("--mid_layer", type=int, default=6, help="the extra layer used in last2+mid (default 6)")
     args = ap.parse_args()
 
-    device = args.device if torch.cuda.is_available() and args.device.startswith("cuda") else "cpu"
+    device = str(resolve_device(args.device, allow_cpu_fallback=False))
     model, _ = clip.load(args.clip_model, device=device, jit=False)
     model = model.eval()
 
