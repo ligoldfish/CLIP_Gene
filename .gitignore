@@ -1,0 +1,28 @@
+# ---- caches ----
+__pycache__/
+*.pyc
+.pytest_cache/
+.playwright-mcp/
+.vscode/
+.claude/
+
+# ---- 产物 / 权重（不进 git，远端另传或重训）----
+saved_models/
+savedmodels/
+results/
+*.pth
+*.pt
+*.safetensors
+*.bin
+
+# ---- 数据集（不进 git，远端 scp 或重下）----
+coco2017/
+CIFAR100_splited/
+CIFAR-100/
+elevater_data/
+flickr30k/
+cc3m/
+clip-vit-base-patch32/
+TinyCLIP-*/
+*.tar.gz
+*.pdf

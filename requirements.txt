@@ -1,0 +1,13 @@
+# 注意：torch / torch_npu 不在此处！
+# NPU 上 torch + torch_npu 必须匹配 CANN 版本，按 Ascend 官方指引单独装（见 DEPLOY_NPU.md）。
+# CUDA 上则单独装匹配 CUDA 的 torch/torchvision。
+transformers>=4.37,<4.45
+safetensors>=0.4
+ftfy
+regex
+numpy
+Pillow
+tqdm
+matplotlib
+# openai clip（提供 clip.model.build_model + clip.tokenize，离线安全）：
+#   pip install git+https://github.com/openai/CLIP.git
