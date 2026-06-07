@@ -21,6 +21,7 @@ CIFAR100_splited/
 CIFAR-100/
 elevater_data/
 flickr30k/
+imagenet/
 cc3m/
 clip-vit-base-patch32/
 TinyCLIP-*/

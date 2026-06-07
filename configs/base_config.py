@@ -10,23 +10,29 @@ class Config:
     OPEN_WORLD_DATA = "./CIFAR100_splited/CIFAR100_splited/novel/train"
     NOVEL_CLASSES_DATA = "./CIFAR100_splited/CIFAR100_splited/open_world/train"
 
-    # CIFAR-100 (zero-shot 评估用 pickle)。本地树在 CLIPgene/CIFAR-100，
-    # 脚本 cwd 通常是 learngene_clip，故默认 ../CIFAR-100。AutoDL 上按需覆盖。
+    # 所有数据均放在仓库目录下（相对 learngene_clip / CLIP_Gene 仓库根）
+    # CIFAR-100 (zero-shot 评估用 pickle)
     CIFAR_ROOT = "./CIFAR-100"
-    CIFAR100_PICKLE_DIR = os.path.join("..", "CIFAR-100", "cifar-100-python")
+    CIFAR100_PICKLE_DIR = os.path.join(".", "CIFAR-100", "cifar-100-python")
 
-    # COCO2017（本地实际目录；原 "autodl-tmp" 路径已修正）
+    # COCO2017
     COCO_ROOT = "./coco2017"
     train_img_dir = os.path.join(COCO_ROOT, "train2017")
     train_ann_file = os.path.join(COCO_ROOT, "annotations_trainval2017", "captions_train2017.json")
     COCO_VAL_IMG_DIR = os.path.join(COCO_ROOT, "val2017")
     COCO_VAL_ANN = os.path.join(COCO_ROOT, "annotations_trainval2017", "captions_val2017.json")
 
-    # Flickr30k（非本地；缺则评估跳过）
-    FLICKR30K_IMG_DIR = ""        # e.g. "./flickr30k/images"
-    FLICKR30K_ANN = ""            # Karpathy flickr test split json
+    # ELEVATER 小集（torchvision 下载到此）
+    ELEVATER_ROOT = "./elevater_data"
 
-    # CC3M（非本地；规模阶段 provision 后填）
+    # Flickr30k（仓库内 ./flickr30k/{images, dataset_flickr30k.json}）
+    FLICKR30K_IMG_DIR = "./flickr30k/images"
+    FLICKR30K_ANN = "./flickr30k/dataset_flickr30k.json"
+
+    # ImageNet-1k val（torchvision.datasets.ImageNet 布局：./imagenet/{val, devkit}）
+    IMAGENET_ROOT = "./imagenet"
+
+    # CC3M（不下载）
     CC3M_ROOT = ""
 
     # =========================================================================
