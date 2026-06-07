@@ -64,10 +64,10 @@ def _make_xcap(xcap, key):
 
 
 def _accum(acc, X, Y):
-    # X,Y: [L,B,D] -> [(L*B), D]
-    Xf = X.reshape(-1, X.shape[-1]).double()
-    Yf = Y.reshape(-1, Y.shape[-1]).double()
-    ones = torch.ones(Xf.shape[0], 1, dtype=torch.float64, device=Xf.device)
+    # X,Y: [L,B,D] -> [(L*B), D]；正规方程在 CPU/float64 上算（NPU 对 float64/linalg 支持差）
+    Xf = X.reshape(-1, X.shape[-1]).detach().cpu().double()
+    Yf = Y.reshape(-1, Y.shape[-1]).detach().cpu().double()
+    ones = torch.ones(Xf.shape[0], 1, dtype=torch.float64)
     Xa = torch.cat([Xf, ones], dim=1)              # [N, D+1]
     acc["XtX"] = acc["XtX"] + Xa.t() @ Xa          # [D+1, D+1]
     acc["XtY"] = acc["XtY"] + Xa.t() @ Yf          # [D+1, D]

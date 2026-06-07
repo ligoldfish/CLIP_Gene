@@ -138,9 +138,19 @@ class StudentTextEncoder(nn.Module):
         self.ln_final = copy.deepcopy(teacher_clip.ln_final)
         self.text_projection = nn.Parameter(teacher_clip.text_projection.detach().clone(),
                                             requires_grad=not freeze_head)
+        # openai clip 的因果 mask 存在每个 resblock 上（transformer.attn_mask 通常为 None）
         attn_mask = getattr(getattr(teacher_clip, "transformer", None), "attn_mask", None)
         if attn_mask is None:
             attn_mask = getattr(teacher_clip, "attn_mask", None)
+        if attn_mask is None:
+            rb = getattr(getattr(teacher_clip, "transformer", None), "resblocks", None)
+            if rb is not None and len(rb) > 0:
+                attn_mask = getattr(rb[0], "attn_mask", None)
+        if attn_mask is None:
+            # 末路：按 context_length 重建上三角 -inf 因果 mask
+            ctx = int(teacher_clip.positional_embedding.shape[0])
+            m = torch.empty(ctx, ctx).fill_(float("-inf")).triu_(1)
+            attn_mask = m
         assert attn_mask is not None, "teacher 须提供文本 attn_mask"
         self.register_buffer("attn_mask", attn_mask.detach().clone().float(), persistent=False)
 
