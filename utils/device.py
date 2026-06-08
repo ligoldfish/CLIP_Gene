@@ -35,12 +35,14 @@ def is_npu() -> bool:
     return _BACKEND == "npu"
 
 
-def autocast(enabled: bool = True):
-    """混合精度上下文。CPU 上为 no-op。"""
+def autocast(enabled: bool = True, dtype=None):
+    """混合精度上下文。dtype=None 走后端默认(fp16)；可传 torch.bfloat16。CPU 上 no-op。"""
+    if not enabled:
+        return contextlib.nullcontext()
     if _BACKEND == "npu":
-        return torch.npu.amp.autocast(enabled=enabled)
+        return torch.npu.amp.autocast(dtype=dtype) if dtype is not None else torch.npu.amp.autocast()
     if _BACKEND == "cuda":
-        return torch.cuda.amp.autocast(enabled=enabled)
+        return torch.cuda.amp.autocast(dtype=dtype) if dtype is not None else torch.cuda.amp.autocast()
     return contextlib.nullcontext()
 
 

@@ -135,6 +135,8 @@ def main():
                     help="每 N step 在 CIFAR-100 子集上测 top1 并记成本曲线（0=关）")
     ap.add_argument("--cost_target", type=float, default=30.0, help="成本曲线目标 top1(%)")
     ap.add_argument("--cost_csv", default="", help="成本曲线 CSV（默认 results/cost_K{K}_{init}.csv）")
+    ap.add_argument("--amp", choices=["bf16", "fp16", "fp32"], default="bf16",
+                    help="混合精度：bf16(默认,NPU 推荐,无 loss scaler) / fp16(用 GradScaler) / fp32(关 AMP)")
     args = ap.parse_args()
 
     cfg = config
@@ -175,7 +177,11 @@ def main():
 
     total_steps = args.epochs * len(dl)
     warmup_steps = int(cfg.WARMUP_RATIO * total_steps)
-    scaler = make_grad_scaler()
+    # AMP 策略：bf16/fp32 不需要 loss scaler（避免 fp16 溢出导致 scale→0 的死亡螺旋）
+    amp_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}[args.amp]
+    use_scaler = (args.amp == "fp16")
+    scaler = make_grad_scaler() if use_scaler else None
+    print(f"[train] AMP={args.amp} (scaler={'on' if use_scaler else 'off'})")
     teacher_scale = teacher.logit_scale.exp().clamp(max=cfg.LOGIT_SCALE_MAX).detach()
 
     cost = setup_cost_eval(student, cfg, args, device)
@@ -191,23 +197,32 @@ def main():
 
             with torch.no_grad():
                 zi_t, zt_t = teacher_embeddings(teacher, imgs, toks)
-            with autocast():
+            with autocast(enabled=amp_dtype is not None, dtype=amp_dtype):
                 zi_s = student.encode_image(imgs)
                 zt_s = student.encode_text(toks)
             zi_s, zt_s = zi_s.float(), zt_s.float()
             scale_s = student.logit_scale.exp().clamp(max=cfg.LOGIT_SCALE_MAX)
             loss, parts = compute_distill_loss(zi_s, zt_s, zi_t, zt_t, scale_s, teacher_scale, cfg)
 
+            if not torch.isfinite(loss):
+                print(f"  [warn] step {global_step} loss 非有限({loss.item()})，跳过"); global_step += 1
+                continue
+
             lr_scale = cosine_with_warmup(global_step, total_steps, warmup_steps)
             for g in optim.param_groups:
                 g["lr"] = g["_base"] * lr_scale
 
             optim.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(optim)
-            torch.nn.utils.clip_grad_norm_(student.trainable_parameters(), cfg.MAX_GRAD_NORM)
-            scaler.step(optim)
-            scaler.update()
+            if use_scaler:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optim)
+                torch.nn.utils.clip_grad_norm_(student.trainable_parameters(), cfg.MAX_GRAD_NORM)
+                scaler.step(optim)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.trainable_parameters(), cfg.MAX_GRAD_NORM)
+                optim.step()
 
             run_sum += loss.item(); run_n += 1; global_step += 1
             if step % cfg.LOG_INTERVAL == 0:
