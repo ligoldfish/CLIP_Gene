@@ -59,6 +59,22 @@ def reinit_gene_blocks(student):
             _reset(w.gene_block)
 
 
+def _is_norm_name(n: str) -> bool:
+    return n.startswith("ln_") or ".ln_" in n or "norm" in n.lower()
+
+
+def unfreeze_gene_norms(student):
+    """B: 解冻基因块内 LayerNorm（仅 ln_1/ln_2），其余基因权重仍冻结。"""
+    cnt = 0
+    for enc in [student.vision, student.text]:
+        for w in enc.trunk.blocks:
+            for n, p in w.gene_block.named_parameters():
+                if _is_norm_name(n):
+                    p.requires_grad_(True)
+                    cnt += p.numel()
+    print(f"[train] LN-tuning: 解冻基因 LayerNorm {cnt/1e3:.1f}K 参数")
+
+
 def get_param_groups(student, cfg):
     adapters, stitches = [], []
     for m in student.modules():
@@ -66,6 +82,13 @@ def get_param_groups(student, cfg):
             adapters += [p for p in m.parameters() if p.requires_grad]
         elif isinstance(m, StitchLayer):
             stitches += [p for p in m.parameters() if p.requires_grad]
+    # B: 基因块内被解冻的 LayerNorm 参数
+    gene_norms = []
+    for enc in [student.vision, student.text]:
+        for w in enc.trunk.blocks:
+            for n, p in w.gene_block.named_parameters():
+                if p.requires_grad and _is_norm_name(n):
+                    gene_norms.append(p)
     extra = []
     if cfg.TRAIN_POS_PROJ:
         for enc, attrs in [(student.vision, ["positional_embedding", "proj"]),
@@ -78,17 +101,20 @@ def get_param_groups(student, cfg):
     groups = [
         {"params": adapters, "lr": cfg.LR_MAIN, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_MAIN},
         {"params": stitches, "lr": cfg.LR_STITCH, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_STITCH},
+        {"params": gene_norms, "lr": cfg.LR_MAIN, "weight_decay": 0.0, "_base": cfg.LR_MAIN},
         {"params": [student.logit_scale], "lr": cfg.LR_MAIN, "weight_decay": 0.0, "_base": cfg.LR_MAIN},
         {"params": extra, "lr": cfg.LR_MAIN * 0.1, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_MAIN * 0.1},
     ]
     return [g for g in groups if len(g["params"]) > 0]
 
 
-def assert_genes_frozen(student):
+def assert_genes_frozen(student, allow_norms=False):
     for enc in [student.vision, student.text]:
         for w in enc.trunk.blocks:
             for n, p in w.gene_block.named_parameters():
-                assert p.requires_grad is False, f"基因参数 {n} 未冻结！"
+                if allow_norms and _is_norm_name(n):
+                    continue
+                assert p.requires_grad is False, f"基因非norm参数 {n} 未冻结！"
 
 
 def setup_cost_eval(student, cfg, args, device):
@@ -137,9 +163,31 @@ def main():
     ap.add_argument("--cost_csv", default="", help="成本曲线 CSV（默认 results/cost_K{K}_{init}.csv）")
     ap.add_argument("--amp", choices=["bf16", "fp16", "fp32"], default="bf16",
                     help="混合精度：bf16(默认,NPU 推荐,无 loss scaler) / fp16(用 GradScaler) / fp32(关 AMP)")
+    ap.add_argument("--contiguous", action="store_true",
+                    help="A: 选连续段基因（覆盖 config.CONTIGUOUS_SPAN）")
+    ap.add_argument("--train_gene_norms", action="store_true",
+                    help="B: 解冻基因块内 LayerNorm（LN-tuning）")
+    ap.add_argument("--adapter_bottleneck", type=int, default=config.ADAPTER_BOTTLENECK,
+                    help="D: adapter 瓶颈维（默认 config 值；调大如 128 增容量）")
     args = ap.parse_args()
 
     cfg = config
+    # CLI 覆盖配置（A/B/D），并存进 ckpt 以便评估重建对齐
+    cfg.CONTIGUOUS_SPAN = bool(args.contiguous) or cfg.CONTIGUOUS_SPAN
+    cfg.ADAPTER_BOTTLENECK = args.adapter_bottleneck
+    cfg.TRAIN_GENE_NORMS = bool(args.train_gene_norms) or cfg.TRAIN_GENE_NORMS
+    run_tag = args.init
+    if cfg.CONTIGUOUS_SPAN:
+        run_tag += "_contig"
+    if cfg.TRAIN_GENE_NORMS:
+        run_tag += "_ln"
+    if cfg.ADAPTER_BOTTLENECK != 64:
+        run_tag += f"_ab{cfg.ADAPTER_BOTTLENECK}"
+    if not args.cost_csv:
+        args.cost_csv = os.path.join("results", f"cost_K{args.K}_{run_tag}.csv")
+    print(f"[train] tag={run_tag} contiguous={cfg.CONTIGUOUS_SPAN} "
+          f"adapter_bottleneck={cfg.ADAPTER_BOTTLENECK} train_gene_norms={cfg.TRAIN_GENE_NORMS}")
+
     os.makedirs(cfg.SAVE_DIR, exist_ok=True)
     set_seed(cfg.CALIB_SEED)
     device = cfg.DEVICE
@@ -154,7 +202,9 @@ def main():
         reinit_gene_blocks(student)
         print(f"[train] init={args.init}: 基因块已随机重置（baseline）")
 
-    assert_genes_frozen(student)
+    if cfg.TRAIN_GENE_NORMS:
+        unfreeze_gene_norms(student)
+    assert_genes_frozen(student, allow_norms=cfg.TRAIN_GENE_NORMS)
 
     # LSQ 初始化缝合（用确定性标定子集）
     if not args.no_lsq and (meta["vision_gaps"] + meta["text_gaps"] > 0):
@@ -241,9 +291,13 @@ def main():
         print(f"[E{epoch}] mean_loss={epoch_loss:.4f} time={(time.time()-t0)/60:.1f}min")
         if epoch_loss < best_loss:
             best_loss = epoch_loss
-            save_path = os.path.join(cfg.SAVE_DIR, f"student_K{args.K}_{args.init}.pth")
+            save_path = os.path.join(cfg.SAVE_DIR, f"student_K{args.K}_{run_tag}.pth")
             torch.save({"state_dict": student.state_dict(), "meta": meta,
-                        "K": args.K, "init": args.init, "epoch": epoch, "loss": epoch_loss}, save_path)
+                        "K": args.K, "init": args.init, "tag": run_tag,
+                        "contiguous": cfg.CONTIGUOUS_SPAN,
+                        "adapter_bottleneck": cfg.ADAPTER_BOTTLENECK,
+                        "train_gene_norms": cfg.TRAIN_GENE_NORMS,
+                        "epoch": epoch, "loss": epoch_loss}, save_path)
             print(f"[train] saved best -> {save_path} (loss={best_loss:.4f})")
 
 

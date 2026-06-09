@@ -77,6 +77,7 @@ class Config:
     CONTIGUOUS_SPAN = False        # True = 连续段选层消融
 
     ADAPTER_BOTTLENECK = 64
+    TRAIN_GENE_NORMS = False       # B: 解冻基因块内 LayerNorm（BitFit/LN-tuning，廉价高收益）
     USE_SHALLOW_CNN = False        # gate VisionShallowCNN / TextShallowCNN
     SHALLOW_CNN_LAYERS_V = 2
     SHALLOW_CNN_LAYERS_T = 1

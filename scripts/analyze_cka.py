@@ -103,11 +103,17 @@ def main():
 
     device = config.DEVICE
     teacher, preprocess = load_teacher_offline(config, device)
-    student, meta, preprocess, teacher = build_student_from_gene(
-        config, K=args.K, device=device, teacher=teacher, preprocess=preprocess)
+    ckpt = None
+    K = args.K
     if args.ckpt:
-        # 自存可信 ckpt
+        # 自存可信 ckpt；先读架构旋钮再 build，确保与权重对齐
         ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
+        K = ckpt.get("K", args.K)
+        config.CONTIGUOUS_SPAN = ckpt.get("contiguous", config.CONTIGUOUS_SPAN)
+        config.ADAPTER_BOTTLENECK = ckpt.get("adapter_bottleneck", config.ADAPTER_BOTTLENECK)
+    student, meta, preprocess, teacher = build_student_from_gene(
+        config, K=K, device=device, teacher=teacher, preprocess=preprocess)
+    if ckpt is not None:
         student.load_state_dict(ckpt["state_dict"])
     student.eval()
 
