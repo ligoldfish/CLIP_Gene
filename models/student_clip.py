@@ -18,6 +18,7 @@ from models.blocks import (
     VisionShallowCNN,
     TextShallowCNN,
 )
+from models.front_blocks import FrontBlocks
 
 
 def _stitch_presence(sel: List[int], stitch_at_head: bool, n_total: int):
@@ -76,7 +77,8 @@ class StudentVisionEncoder(nn.Module):
                  adapter_bottleneck: int = 64, use_shallow_cnn: bool = False,
                  shallow_layers: int = 2, shallow_bottleneck: int = 64,
                  use_full_stitch: bool = True, stitch_rank: int = 32, stitch_at_head: bool = False,
-                 n_total: int = 12, freeze_stem: bool = True, freeze_post: bool = True):
+                 n_total: int = 12, freeze_stem: bool = True, freeze_post: bool = True,
+                 front_blocks: Optional[List[nn.Module]] = None):
         super().__init__()
         self.conv1 = copy.deepcopy(teacher_visual.conv1)
         self.class_embedding = nn.Parameter(teacher_visual.class_embedding.detach().clone(),
@@ -104,8 +106,9 @@ class StudentVisionEncoder(nn.Module):
 
         self.trunk = _StitchedTrunk(gene_blocks, sel, width, adapter_bottleneck,
                                     use_full_stitch, stitch_rank, stitch_at_head, n_total)
+        self.front = FrontBlocks(front_blocks) if front_blocks else None
 
-    def forward(self, x, return_hidden=False):
+    def _stem(self, x):
         x = self.conv1(x)                              # [B, D, H, W]
         if self.use_shallow_cnn:
             x = self.shallow(x)
@@ -115,7 +118,19 @@ class StudentVisionEncoder(nn.Module):
         x = torch.cat([cls, x], dim=1)                 # [B, 1+HW, D]
         x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
-        x = x.permute(1, 0, 2)                          # [L, B, D]
+        return x.permute(1, 0, 2)                       # [L, B, D]
+
+    def forward_front(self, images):
+        """stem + 前端块（不过 trunk），返回 [L,B,D]，供蒸馏预热。"""
+        x = self._stem(images)
+        if self.front is not None:
+            x = self.front.run(x)
+        return x
+
+    def forward(self, x, return_hidden=False):
+        x = self._stem(x)
+        if self.front is not None:
+            x = self.front.run(x)
         out = self.trunk.run(x, return_hidden=return_hidden)
         x, hidden = out if return_hidden else (out, None)
         x = x.permute(1, 0, 2)
@@ -130,7 +145,8 @@ class StudentTextEncoder(nn.Module):
                  adapter_bottleneck: int = 64, use_shallow_cnn: bool = False,
                  shallow_layers: int = 1, shallow_bottleneck: int = 64,
                  use_full_stitch: bool = True, stitch_rank: int = 32, stitch_at_head: bool = False,
-                 n_total: int = 12, freeze_embed: bool = True, freeze_head: bool = True):
+                 n_total: int = 12, freeze_embed: bool = True, freeze_head: bool = True,
+                 front_blocks: Optional[List[nn.Module]] = None):
         super().__init__()
         self.token_embedding = copy.deepcopy(teacher_clip.token_embedding)
         self.positional_embedding = nn.Parameter(teacher_clip.positional_embedding.detach().clone(),
@@ -167,15 +183,28 @@ class StudentTextEncoder(nn.Module):
 
         self.trunk = _StitchedTrunk(gene_blocks, sel, width, adapter_bottleneck,
                                     use_full_stitch, stitch_rank, stitch_at_head, n_total)
+        self.front = FrontBlocks(front_blocks) if front_blocks else None
 
-    def forward(self, tokens, return_hidden=False):
+    def _stem(self, tokens):
         x = self.token_embedding(tokens).type(self.positional_embedding.dtype)  # [B,T,D]
         x = x + self.positional_embedding
         if self.use_shallow_cnn:
             x = x.permute(0, 2, 1).contiguous()        # [B,D,T]
             x = self.shallow(x)
             x = x.permute(0, 2, 1)                      # [B,T,D]
-        x = x.permute(1, 0, 2)                          # [T,B,D]
+        return x.permute(1, 0, 2)                       # [T,B,D]
+
+    def forward_front(self, tokens):
+        """embed + 前端块（不过 trunk），返回 [T,B,D]，供蒸馏预热。"""
+        x = self._stem(tokens)
+        if self.front is not None:
+            x = self.front.run(x, attn_mask=self.attn_mask)
+        return x
+
+    def forward(self, tokens, return_hidden=False):
+        x = self._stem(tokens)
+        if self.front is not None:
+            x = self.front.run(x, attn_mask=self.attn_mask)
         out = self.trunk.run(x, attn_mask=self.attn_mask, return_hidden=return_hidden)
         x, hidden = out if return_hidden else (out, None)
         x = x.permute(1, 0, 2)                          # [B,T,D]

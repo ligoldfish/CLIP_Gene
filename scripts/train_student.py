@@ -30,7 +30,11 @@ from utils.losses_distill import compute_distill_loss
 from utils.teacher_forward import teacher_embeddings
 from models.blocks import ResidualAdapter, StitchLayer
 from models.stitch_init import lsq_init_stitches
+from models.front_init import preheat_front_blocks
+from models.lora import LoRALinear, LoRAMultiheadAttention
 from utils.device import autocast, make_grad_scaler, manual_seed_all
+
+_LORA_SUFFIX = (".A", ".B", "_A", "_B")
 
 
 def set_seed(s=42):
@@ -49,7 +53,9 @@ def reinit_gene_blocks(student):
     """随机重置基因块权重（仍冻结），用于 random/scratch 消融 baseline。"""
     @torch.no_grad()
     def _reset(block):
-        for p in block.parameters():
+        for n, p in block.named_parameters():
+            if n.endswith(_LORA_SUFFIX):   # 保 LoRA 零初始化，只重置基因 base
+                continue
             if p.dim() >= 2:
                 nn.init.xavier_uniform_(p)
             else:
@@ -76,12 +82,19 @@ def unfreeze_gene_norms(student):
 
 
 def get_param_groups(student, cfg):
-    adapters, stitches = [], []
+    adapters, stitches, lora = [], [], []
     for m in student.modules():
         if isinstance(m, ResidualAdapter):
             adapters += [p for p in m.parameters() if p.requires_grad]
         elif isinstance(m, StitchLayer):
             stitches += [p for p in m.parameters() if p.requires_grad]
+        elif isinstance(m, (LoRALinear, LoRAMultiheadAttention)):
+            lora += [p for p in m.parameters() if p.requires_grad]   # base 冻结被过滤
+    # V2: 前端块（可训）
+    front = []
+    for enc in [student.vision, student.text]:
+        if getattr(enc, "front", None) is not None:
+            front += [p for p in enc.front.parameters() if p.requires_grad]
     # B: 基因块内被解冻的 LayerNorm 参数
     gene_norms = []
     for enc in [student.vision, student.text]:
@@ -98,9 +111,12 @@ def get_param_groups(student, cfg):
                 if isinstance(p, nn.Parameter):
                     p.requires_grad_(True)
                     extra.append(p)
+    lr_front = getattr(cfg, "LR_FRONT", cfg.LR_MAIN)
     groups = [
         {"params": adapters, "lr": cfg.LR_MAIN, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_MAIN},
         {"params": stitches, "lr": cfg.LR_STITCH, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_STITCH},
+        {"params": front, "lr": lr_front, "weight_decay": cfg.WEIGHT_DECAY, "_base": lr_front},
+        {"params": lora, "lr": cfg.LR_MAIN, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_MAIN},
         {"params": gene_norms, "lr": cfg.LR_MAIN, "weight_decay": 0.0, "_base": cfg.LR_MAIN},
         {"params": [student.logit_scale], "lr": cfg.LR_MAIN, "weight_decay": 0.0, "_base": cfg.LR_MAIN},
         {"params": extra, "lr": cfg.LR_MAIN * 0.1, "weight_decay": cfg.WEIGHT_DECAY, "_base": cfg.LR_MAIN * 0.1},
@@ -114,7 +130,9 @@ def assert_genes_frozen(student, allow_norms=False):
             for n, p in w.gene_block.named_parameters():
                 if allow_norms and _is_norm_name(n):
                     continue
-                assert p.requires_grad is False, f"基因非norm参数 {n} 未冻结！"
+                if n.endswith(_LORA_SUFFIX):     # LoRA 增量可训，跳过
+                    continue
+                assert p.requires_grad is False, f"基因 base 参数 {n} 未冻结！"
 
 
 def setup_cost_eval(student, cfg, args, device):
@@ -169,16 +187,40 @@ def main():
                     help="B: 解冻基因块内 LayerNorm（LN-tuning）")
     ap.add_argument("--adapter_bottleneck", type=int, default=config.ADAPTER_BOTTLENECK,
                     help="D: adapter 瓶颈维（默认 config 值；调大如 128 增容量）")
+    # V2
+    ap.add_argument("--no_preheat", action="store_true", help="跳过前端蒸馏预热")
+    ap.add_argument("--front_init", choices=["distill", "none"], default=None,
+                    help="前端初始化（覆盖 config.FRONT_INIT）")
+    ap.add_argument("--front_blocks_v", type=int, default=None)
+    ap.add_argument("--front_blocks_t", type=int, default=None)
+    lora_grp = ap.add_mutually_exclusive_group()
+    lora_grp.add_argument("--use_lora", dest="use_lora", action="store_true", default=None)
+    lora_grp.add_argument("--no_lora", dest="use_lora", action="store_false", default=None)
+    ap.add_argument("--lora_rank", type=int, default=None)
     args = ap.parse_args()
 
     cfg = config
-    # CLI 覆盖配置（A/B/D），并存进 ckpt 以便评估重建对齐
+    # CLI 覆盖配置（A/B/D + V2），并存进 ckpt 以便评估重建对齐
     cfg.CONTIGUOUS_SPAN = bool(args.contiguous) or cfg.CONTIGUOUS_SPAN
     cfg.ADAPTER_BOTTLENECK = args.adapter_bottleneck
     cfg.TRAIN_GENE_NORMS = bool(args.train_gene_norms) or cfg.TRAIN_GENE_NORMS
+    if args.front_init is not None:
+        cfg.FRONT_INIT = args.front_init
+    if args.front_blocks_v is not None:
+        cfg.FRONT_BLOCKS_V = args.front_blocks_v
+    if args.front_blocks_t is not None:
+        cfg.FRONT_BLOCKS_T = args.front_blocks_t
+    if args.use_lora is not None:
+        cfg.USE_LORA = args.use_lora
+    if args.lora_rank is not None:
+        cfg.LORA_RANK = args.lora_rank
     run_tag = args.init
     if cfg.CONTIGUOUS_SPAN:
         run_tag += "_contig"
+    if cfg.FRONT_INIT == "distill" and (cfg.FRONT_BLOCKS_V or cfg.FRONT_BLOCKS_T):
+        run_tag += "_front"
+    if cfg.USE_LORA:
+        run_tag += f"_lora{cfg.LORA_RANK}"
     if cfg.TRAIN_GENE_NORMS:
         run_tag += "_ln"
     if cfg.ADAPTER_BOTTLENECK != 64:
@@ -205,6 +247,16 @@ def main():
     if cfg.TRAIN_GENE_NORMS:
         unfreeze_gene_norms(student)
     assert_genes_frozen(student, allow_norms=cfg.TRAIN_GENE_NORMS)
+
+    # V2: 前端蒸馏预热（在 LSQ 之前；前端输出→teacher 首基因输入）
+    front_present = (getattr(student.vision, "front", None) is not None) or \
+                    (getattr(student.text, "front", None) is not None)
+    if (not args.no_preheat) and cfg.FRONT_INIT == "distill" and front_present:
+        pre_calib = make_calibration_subset(
+            cfg.train_img_dir, cfg.train_ann_file, preprocess, clip.tokenize,
+            n_pairs=min(cfg.PREHEAT_PAIRS, cfg.CALIB_PAIRS), batch_size=cfg.CALIB_BATCH_SIZE,
+            seed=cfg.CALIB_SEED, num_workers=cfg.num_workers)
+        preheat_front_blocks(student, teacher, pre_calib, device, cfg)
 
     # LSQ 初始化缝合（用确定性标定子集）
     if not args.no_lsq and (meta["vision_gaps"] + meta["text_gaps"] > 0):
@@ -297,6 +349,11 @@ def main():
                         "contiguous": cfg.CONTIGUOUS_SPAN,
                         "adapter_bottleneck": cfg.ADAPTER_BOTTLENECK,
                         "train_gene_norms": cfg.TRAIN_GENE_NORMS,
+                        "front_init": cfg.FRONT_INIT,
+                        "front_blocks_v": cfg.FRONT_BLOCKS_V,
+                        "front_blocks_t": cfg.FRONT_BLOCKS_T,
+                        "use_lora": cfg.USE_LORA, "lora_rank": cfg.LORA_RANK,
+                        "lora_targets": list(cfg.LORA_TARGETS),
                         "epoch": epoch, "loss": epoch_loss}, save_path)
             print(f"[train] saved best -> {save_path} (loss={best_loss:.4f})")
 

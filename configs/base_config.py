@@ -76,9 +76,26 @@ class Config:
     BUDGET_K_T = None              # 文本侧单独覆盖
     CONTIGUOUS_SPAN = False        # True = 连续段选层消融
 
-    ADAPTER_BOTTLENECK = 64
+    ADAPTER_BOTTLENECK = 256       # V2: 加宽 64->256
     TRAIN_GENE_NORMS = False       # B: 解冻基因块内 LayerNorm（BitFit/LN-tuning，廉价高收益）
     USE_SHALLOW_CNN = False        # gate VisionShallowCNN / TextShallowCNN
+
+    # ===== V2: 前端块 + LoRA + 蒸馏预热 =====
+    # 前端可训 transformer 块（基因块之前），蒸馏预热初始化
+    FRONT_BLOCKS_V = 4
+    FRONT_BLOCKS_T = 2
+    FRONT_INIT = "distill"         # "distill"(预热) | "none"
+    LR_FRONT = 1e-4                # 前端主训练 LR（预热后温和）
+    PREHEAT_PAIRS = 2500           # 预热标定对数
+    PREHEAT_EPOCHS = 4
+    PREHEAT_LR = 1e-3
+    PREHEAT_WD = 0.0
+    PREHEAT_AMP = False            # 预热用 fp32（稳）
+    # 基因块内 LoRA（基因 base 权重冻结）
+    USE_LORA = True
+    LORA_RANK = 16
+    LORA_TARGETS = ["attn", "mlp"] # 注入位置
+    LORA_ALPHA = None              # None => alpha=rank（scaling=1）
     SHALLOW_CNN_LAYERS_V = 2
     SHALLOW_CNN_LAYERS_T = 1
     SHALLOW_CNN_BOTTLENECK = 64

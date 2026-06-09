@@ -111,6 +111,12 @@ def main():
         K = ckpt.get("K", args.K)
         config.CONTIGUOUS_SPAN = ckpt.get("contiguous", config.CONTIGUOUS_SPAN)
         config.ADAPTER_BOTTLENECK = ckpt.get("adapter_bottleneck", config.ADAPTER_BOTTLENECK)
+        config.FRONT_INIT = ckpt.get("front_init", config.FRONT_INIT)
+        config.FRONT_BLOCKS_V = ckpt.get("front_blocks_v", config.FRONT_BLOCKS_V)
+        config.FRONT_BLOCKS_T = ckpt.get("front_blocks_t", config.FRONT_BLOCKS_T)
+        config.USE_LORA = ckpt.get("use_lora", config.USE_LORA)
+        config.LORA_RANK = ckpt.get("lora_rank", config.LORA_RANK)
+        config.LORA_TARGETS = ckpt.get("lora_targets", config.LORA_TARGETS)
     student, meta, preprocess, teacher = build_student_from_gene(
         config, K=K, device=device, teacher=teacher, preprocess=preprocess)
     if ckpt is not None:

@@ -33,18 +33,30 @@ def _gaps(sel: List[int], stitch_at_head: bool, n_total: int) -> int:
     return pre + mids + post
 
 
+_LORA_SUFFIX = (".A", ".B", "_A", "_B")
+
+
+def _canon(n: str) -> str:
+    # LoRALinear 把 base 权重移到 mlp.c_fc.base.* —— 还原成 teacher 名 mlp.c_fc.*
+    return n.replace("mlp.c_fc.base.", "mlp.c_fc.").replace("mlp.c_proj.base.", "mlp.c_proj.")
+
+
 @torch.no_grad()
-def _assert_gene_params_loaded(student, teacher, vis_sel, txt_sel):
+def _assert_gene_params_loaded(student, teacher, vis_sel, txt_sel, use_lora=False):
     def check(wrappers, teacher_blocks, sel, name):
         assert len(wrappers) == len(sel), f"{name} 块数 {len(wrappers)} != K {len(sel)}"
         for w, idx in zip(wrappers, sel):
             tb = teacher_blocks[idx]
             tp = dict(tb.named_parameters())
             for n, p in w.gene_block.named_parameters():
-                assert n in tp, f"{name} 块{idx} 缺参数 {n}"
-                assert torch.equal(p.detach().cpu(), tp[n].detach().cpu()), \
-                    f"{name} 块{idx} 参数 {n} 与 teacher 不一致（基因被意外重置）"
-                assert p.requires_grad is False, f"{name} 块{idx} 参数 {n} 未冻结"
+                if use_lora and n.endswith(_LORA_SUFFIX):
+                    assert p.requires_grad is True, f"{name} 块{idx} LoRA 参数 {n} 应可训"
+                    continue
+                cn = _canon(n)
+                assert cn in tp, f"{name} 块{idx} 缺参数 {cn}"
+                assert torch.equal(p.detach().cpu(), tp[cn].detach().cpu()), \
+                    f"{name} 块{idx} 参数 {cn} 与 teacher 不一致（基因被意外重置）"
+                assert p.requires_grad is False, f"{name} 块{idx} 参数 {cn} 未冻结"
     check(student.vision.trunk.blocks, teacher.visual.transformer.resblocks, vis_sel, "vision")
     check(student.text.trunk.blocks, teacher.transformer.resblocks, txt_sel, "text")
 
@@ -75,6 +87,28 @@ def build_student_from_gene(
     vis_blocks = [copy.deepcopy(teacher.visual.transformer.resblocks[i]) for i in vis_sel]
     txt_blocks = [copy.deepcopy(teacher.transformer.resblocks[i]) for i in txt_sel]
 
+    # V2: 基因块内注入 LoRA（base 权重冻结）
+    use_lora = getattr(cfg, "USE_LORA", False)
+    if use_lora:
+        from models.lora import inject_lora_into_gene_block
+        tq = tuple(cfg.LORA_TARGETS)
+        for b in vis_blocks:
+            inject_lora_into_gene_block(b, cfg.LORA_RANK, tq)
+        for b in txt_blocks:
+            inject_lora_into_gene_block(b, cfg.LORA_RANK, tq)
+
+    # V2: 前端可训块（deepcopy 首基因前 Nf 块，自适应深度），蒸馏预热初始化
+    front_v = front_t = None
+    if getattr(cfg, "FRONT_INIT", "none") == "distill":
+        nfv = min(int(getattr(cfg, "FRONT_BLOCKS_V", 0)), vis_sel[0]) if vis_sel else 0
+        nft = min(int(getattr(cfg, "FRONT_BLOCKS_T", 0)), txt_sel[0]) if txt_sel else 0
+        if nfv > 0:
+            front_v = [copy.deepcopy(teacher.visual.transformer.resblocks[i])
+                       for i in range(vis_sel[0] - nfv, vis_sel[0])]
+        if nft > 0:
+            front_t = [copy.deepcopy(teacher.transformer.resblocks[i])
+                       for i in range(txt_sel[0] - nft, txt_sel[0])]
+
     width_v = teacher.visual.transformer.width
     width_t = teacher.transformer.width
 
@@ -83,19 +117,27 @@ def build_student_from_gene(
         adapter_bottleneck=cfg.ADAPTER_BOTTLENECK, use_shallow_cnn=cfg.USE_SHALLOW_CNN,
         shallow_layers=cfg.SHALLOW_CNN_LAYERS_V, shallow_bottleneck=cfg.SHALLOW_CNN_BOTTLENECK,
         use_full_stitch=cfg.USE_FULL_STITCH, stitch_rank=cfg.STITCH_RANK,
-        stitch_at_head=cfg.STITCH_AT_HEAD, n_total=n_v,
+        stitch_at_head=cfg.STITCH_AT_HEAD, n_total=n_v, front_blocks=front_v,
     )
     text_enc = StudentTextEncoder(
         teacher, txt_blocks, txt_sel, width=width_t,
         adapter_bottleneck=cfg.ADAPTER_BOTTLENECK, use_shallow_cnn=cfg.USE_SHALLOW_CNN,
         shallow_layers=cfg.SHALLOW_CNN_LAYERS_T, shallow_bottleneck=cfg.SHALLOW_CNN_BOTTLENECK,
         use_full_stitch=cfg.USE_FULL_STITCH, stitch_rank=cfg.STITCH_RANK,
-        stitch_at_head=cfg.STITCH_AT_HEAD, n_total=n_t,
+        stitch_at_head=cfg.STITCH_AT_HEAD, n_total=n_t, front_blocks=front_t,
     )
+    # GeneBlockWrapper 冻结了 gene_block 全部参数（含 LoRA）→ 重新打开 LoRA 增量
+    if use_lora:
+        for enc in [vision_enc, text_enc]:
+            for w in enc.trunk.blocks:
+                for n, p in w.gene_block.named_parameters():
+                    if n.endswith(_LORA_SUFFIX):
+                        p.requires_grad_(True)
+
     logit_scale_init = float(teacher.logit_scale.detach().cpu())
     student = StudentMiniCLIP(vision_enc, text_enc, logit_scale_init, cfg.LOGIT_SCALE_MAX).to(device)
 
-    _assert_gene_params_loaded(student, teacher, vis_sel, txt_sel)
+    _assert_gene_params_loaded(student, teacher, vis_sel, txt_sel, use_lora=use_lora)
     # 缝合数自检
     n_vstitch = sum(1 for m in [student.vision.trunk.pre_stitch, student.vision.trunk.post_stitch]
                     if not isinstance(m, torch.nn.Identity)) + \
@@ -106,6 +148,9 @@ def build_student_from_gene(
         "vision_sel": vis_sel, "text_sel": txt_sel, "Kv": Kv, "Kt": Kt,
         "vision_gaps": _gaps(vis_sel, cfg.STITCH_AT_HEAD, n_v),
         "text_gaps": _gaps(txt_sel, cfg.STITCH_AT_HEAD, n_t),
+        "n_front_v": (len(front_v) if front_v else 0),
+        "n_front_t": (len(front_t) if front_t else 0),
+        "use_lora": use_lora, "lora_rank": getattr(cfg, "LORA_RANK", 0),
         "gene_spec_path": cfg.GENE_SPEC_PATH,
     }
     return student, meta, preprocess, teacher

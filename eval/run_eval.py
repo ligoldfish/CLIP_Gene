@@ -30,9 +30,15 @@ def _load_model(ckpt_arg, device):
     # 故用 weights_only=False 以读回 meta；勿用于加载外部不可信权重。
     ckpt = torch.load(ckpt_arg, map_location=device, weights_only=False)
     K = ckpt.get("K", config.BUDGET_K)
-    # 用 ckpt 记录的架构旋钮重建，确保与权重对齐（连续段/adapter 宽度会改结构）
+    # 用 ckpt 记录的架构旋钮重建，确保与权重对齐（连续段/adapter/前端/LoRA 都改结构）
     config.CONTIGUOUS_SPAN = ckpt.get("contiguous", config.CONTIGUOUS_SPAN)
     config.ADAPTER_BOTTLENECK = ckpt.get("adapter_bottleneck", config.ADAPTER_BOTTLENECK)
+    config.FRONT_INIT = ckpt.get("front_init", config.FRONT_INIT)
+    config.FRONT_BLOCKS_V = ckpt.get("front_blocks_v", config.FRONT_BLOCKS_V)
+    config.FRONT_BLOCKS_T = ckpt.get("front_blocks_t", config.FRONT_BLOCKS_T)
+    config.USE_LORA = ckpt.get("use_lora", config.USE_LORA)
+    config.LORA_RANK = ckpt.get("lora_rank", config.LORA_RANK)
+    config.LORA_TARGETS = ckpt.get("lora_targets", config.LORA_TARGETS)
     student, _, preprocess, _ = build_student_from_gene(
         config, K=K, device=device, teacher=teacher, preprocess=preprocess)
     student.load_state_dict(ckpt["state_dict"])
