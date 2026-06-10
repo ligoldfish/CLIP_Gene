@@ -91,8 +91,8 @@ class Config:
     PREHEAT_LR = 1e-3
     PREHEAT_WD = 0.0
     PREHEAT_AMP = False            # 预热用 fp32（稳）
-    # 基因块内 LoRA（基因 base 权重冻结）
-    USE_LORA = True
+    # 基因块内 LoRA（默认关：小数据上 LoRA 训基因会加剧遗忘）
+    USE_LORA = False
     LORA_RANK = 16
     LORA_TARGETS = ["attn", "mlp"] # 注入位置
     LORA_ALPHA = None              # None => alpha=rank（scaling=1）
@@ -123,9 +123,10 @@ class Config:
 
     # 蒸馏损失权重（同源）
     DISTILL_ALPHA = 1.0            # InfoNCE
-    DISTILL_BETA = 1.0             # 特征 MSE
-    DISTILL_GAMMA = 1.0            # affinity-KL
+    DISTILL_BETA = 10.0           # 特征蒸馏锚（路A：余弦 + 大权重，防遗忘、贴 teacher）
+    DISTILL_GAMMA = 1.0           # affinity-KL
     DISTILL_TAU = 4.0             # affinity-KL 温度
+    DISTILL_FEAT_MODE = "cos"     # "cos"(余弦距离,推荐) | "mse"
 
     # =========================================================================
     # DEPRECATED（新管线忽略；保留供 legacy import 不报错）

@@ -18,6 +18,19 @@ def feature_mse(zi_s, zi_t, zt_s, zt_t) -> torch.Tensor:
     return F.mse_loss(zi_s, zi_t) + F.mse_loss(zt_s, zt_t)
 
 
+def feature_distill(zi_s, zi_t, zt_s, zt_t, mode="cos") -> torch.Tensor:
+    """特征蒸馏锚（学生贴 teacher，防遗忘）。
+
+    "cos": 1-余弦距离（量级~0.5，与 clip/aff 同档，β=1 即有效梯度）—— 推荐，CLIP-KD 特征 mimicry 的归一形式。
+    "mse": 归一向量 MSE（量级太小，需很大 β 才起作用）。
+    """
+    if mode == "cos":
+        di = (1.0 - F.cosine_similarity(zi_s, zi_t, dim=-1)).mean()
+        dt = (1.0 - F.cosine_similarity(zt_s, zt_t, dim=-1)).mean()
+        return di + dt
+    return F.mse_loss(zi_s, zi_t) + F.mse_loss(zt_s, zt_t)
+
+
 def affinity_kl(student_logits: torch.Tensor, teacher_logits: torch.Tensor, tau: float) -> torch.Tensor:
     """对称 KL（行+列），teacher 作软目标。乘 tau^2 标准 KD 缩放。"""
     s = student_logits / tau
@@ -36,7 +49,7 @@ def compute_distill_loss(zi_s, zt_s, zi_t, zt_t, scale_s, scale_t, cfg):
     teacher_logits = scale_t * (zi_t @ zt_t.t())
 
     l_clip = clip_contrastive(logits_i, logits_t)
-    l_feat = feature_mse(zi_s, zi_t, zt_s, zt_t)
+    l_feat = feature_distill(zi_s, zi_t, zt_s, zt_t, mode=getattr(cfg, "DISTILL_FEAT_MODE", "cos"))
     l_aff = affinity_kl(logits_i, teacher_logits.detach(), cfg.DISTILL_TAU)
 
     total = cfg.DISTILL_ALPHA * l_clip + cfg.DISTILL_BETA * l_feat + cfg.DISTILL_GAMMA * l_aff
